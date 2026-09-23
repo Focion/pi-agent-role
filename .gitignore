@@ -1,0 +1,12 @@
+node_modules/
+dist/
+*.tsbuildinfo
+.vitest/
+data/
+*.db
+*.db-wal
+*.db-shm
+.DS_Store
+
+# 运行期数据（role-agent.db / mesh.db / templates 物化 / pi session JSONL）
+.playground/
