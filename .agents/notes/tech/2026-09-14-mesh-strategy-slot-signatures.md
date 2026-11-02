@@ -5,9 +5,11 @@ status: draft
 owner: 待定
 tags: [mesh, policies, interface, role-agent]
 related:
-  - notes/tech/ROLE-AGENT-DESIGN.md
-  - notes/plan/2026-09-14-pi-agent-role-rollout.md
+  - ROLE-AGENT-DESIGN.md
+  - ../plan/2026-11-02-consolidated-audit-and-mesh-alignment-plan.md
 ---
+
+> **版本提示（2026-11-02）**：本文记录 mesh v0.1.0 的历史签名。当前同级 mesh 已迁移到 v0.2.0；本文不是新版本的接口契约。当前差异、适配与已确认的执行边界统一见 [统一计划](../plan/2026-11-02-consolidated-audit-and-mesh-alignment-plan.md)。本轮保留正文，待适配验收后再校准签名。
 
 ## 方案概述
 
