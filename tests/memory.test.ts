@@ -34,7 +34,10 @@ import {
 // ─── 假 KnowledgeService：默认空队列，测试按需替换。─────────────────────────────
 
 function fakeKnowledge(): KnowledgeService {
-  return { learningQueue: () => [] as LearningQueueItem[] } as unknown as KnowledgeService;
+  return {
+    learningQueue: () => [] as LearningQueueItem[],
+    summary: () => "",
+  } as unknown as KnowledgeService;
 }
 
 // ─── 最小假 mesh（只实现 on/nudge，供 attach 消费）──────────────────────────
@@ -347,6 +350,139 @@ describe("P3 记忆子系统（§12 / §14 / §16.3）", () => {
     expect((res.details as { count: number }).count).toBeGreaterThanOrEqual(1);
   });
 
+  it("R22：发送方角色取 agents.role（真实角色名）而非 agentType——authority 权重按老师命中", async () => {
+    const teacherAuthority: MemoryPolicy = {
+      ...defaultMemoryPolicy(),
+      authorityWeights: { teacher: 0.9 },
+    };
+    const h = tracked(setup({ "acct-stu": teacherAuthority }));
+    addRole(h.registry, "agent-stu", "acct-stu", "小明");
+    addRole(h.registry, "agent-tea", "acct-tea", "王老师");
+    // agents.role 才是权威角色名；注册表只带 agentType（"role"）。落一行 role='teacher'。
+    h.db
+      .prepare(
+        `INSERT INTO agents (agent_id, agent_type, blueprint_dir, blueprint_hash, role, status, created_at)
+         VALUES (?, 'role', ?, ?, 'teacher', 'active', ?)`,
+      )
+      .run("agent-tea", "/tmp/bp", "hash-tea", "2026-01-01T00:00:00.000Z");
+
+    const env = envelope("msg-1", "acct-tea", "今天讲受力分析", {
+      to: ["acct-stu"],
+      ext: { virtualTs: "W1D1T8", sceneId: "scene-1", turn: 1 },
+    });
+    h.fake.emit("message_delivered", {
+      envelope: env,
+      endpointId: "ep-agent-stu",
+      accountId: "acct-stu",
+      grade: "steer",
+      woke: true,
+      path: "P1",
+    });
+    await flush();
+    h.fake.emit("message_consumed", {
+      envelope: env,
+      endpointId: "ep-agent-stu",
+      accountId: "acct-stu",
+      partial: false,
+    });
+    await flush();
+
+    const d = decisionOf(h.db, "agent-stu", "msg-1");
+    expect(d).toBeDefined();
+    const comps = JSON.parse(d!.components_json) as Record<string, number>;
+    // 若把 agentType（"role"）当角色名，authorityWeights.role 命中不到，落默认 0.5；
+    // 正确解析出 'teacher' 才命中 0.9。
+    expect(comps.authority).toBeCloseTo(0.9);
+  });
+
+  it("R22：remember 保留 emotion/valence/arousal 到情节；valence 越界 → ARG_INVALID", async () => {
+    const h = tracked(setup());
+    addRole(h.registry, "agent-stu", "acct-stu", "小明");
+    addRole(h.registry, "agent-tea", "acct-tea", "王老师");
+
+    const env = envelope("msg-r22", "acct-tea", "讲到我最怕被点名的题", {
+      to: ["acct-stu"],
+      ext: { virtualTs: "W1D1T8", sceneId: "scene-1", turn: 1 },
+    });
+    h.fake.emit("message_delivered", {
+      envelope: env,
+      endpointId: "ep-agent-stu",
+      accountId: "acct-stu",
+      grade: "steer",
+      woke: true,
+      path: "P1",
+    });
+    await flush();
+
+    const tools = await h.service.domainHandlersFor("acct-stu");
+    const remember = tools.remember as unknown as SimpleTool;
+
+    // 合法值保真落库（§12.3 表）。
+    await remember("tc-1", {
+      gist: "老师点名我上去做受力分析",
+      emotion: "紧张",
+      valence: -0.6,
+      arousal: 0.9,
+      subjectRefs: ["person:agent-tea"],
+    });
+
+    const row = h.db
+      .prepare("SELECT emotion, valence, arousal FROM episodes WHERE owner_agent = ? AND source_msg_id = ?")
+      .get("agent-stu", "msg-r22") as
+      | { emotion: string | null; valence: number | null; arousal: number | null }
+      | undefined;
+    expect(row).toBeDefined();
+    expect(row!.emotion).toBe("紧张");
+    expect(row!.valence).toBeCloseTo(-0.6);
+    expect(row!.arousal).toBeCloseTo(0.9);
+
+    // valence 越界 → ARG_INVALID（不落库）。
+    const bad = await remember("tc-2", { gist: "再写一条", valence: 1.5 });
+    expect(JSON.stringify(bad.content)).toContain("ARG_INVALID");
+  });
+
+  it("R25：显式 recall 留痕——空结果与命中都落 retrieval_log（trigger_msg_id=null，独立于自动注入幂等键）", async () => {
+    const h = tracked(setup());
+    addRole(h.registry, "agent-stu", "acct-stu", "小明");
+    addRole(h.registry, "agent-tea", "acct-tea", "王老师");
+
+    // 起一个活动轮（recall 只能发生在进行中的轮）。
+    const env = envelope("msg-1", "acct-tea", "今天讲受力分析", {
+      to: ["acct-stu"],
+      ext: { virtualTs: "W1D1T8", sceneId: "scene-1", turn: 1 },
+    });
+    h.fake.emit("message_delivered", {
+      envelope: env,
+      endpointId: "ep-agent-stu",
+      accountId: "acct-stu",
+      grade: "steer",
+      woke: true,
+      path: "P1",
+    });
+    await flush();
+
+    const tools = await h.service.domainHandlersFor("acct-stu");
+    const recall = tools.recall as unknown as SimpleTool;
+
+    // 空结果也留痕：候选 0、入选空数组。
+    await recall("tc-1", { query: "量子引力波" });
+    const emptyLog = h.db
+      .prepare("SELECT candidates, selected_json FROM retrieval_log WHERE owner_agent = ? AND trigger_msg_id IS NULL")
+      .get("agent-stu") as { candidates: number; selected_json: string } | undefined;
+    expect(emptyLog).toBeDefined();
+    expect(emptyLog!.selected_json).toBe("[]");
+
+    // 命中留痕：先写记忆再 recall。
+    await (tools.remember as unknown as SimpleTool)("tc-2", { gist: "受力分析的解题方法要画受力图" });
+    const res = await recall("tc-3", { query: "受力分析" });
+    expect((res.details as { count: number }).count).toBeGreaterThanOrEqual(1);
+
+    const n = h.db
+      .prepare("SELECT count(*) AS n FROM retrieval_log WHERE owner_agent = ? AND trigger_msg_id IS NULL")
+      .get("agent-stu") as { n: number };
+    expect(n.n).toBe(2); // 空结果一行 + 命中一行
+  });
+
   it("R3 注入纪律：context 钩子 append-only，同轮幂等只落一次 retrieval_log", async () => {
     const h = tracked(setup());
     addRole(h.registry, "agent-stu", "acct-stu", "小明");
@@ -392,14 +528,16 @@ describe("P3 记忆子系统（§12 / §14 / §16.3）", () => {
     await flush();
 
     const hook = h.service.contextHookFor("acct-stu");
-    const existing = [{ role: "user", content: [{ type: "text", text: "已有消息" }] }];
+    const existing = [{ role: "user", content: "已有消息", timestamp: Date.now() }];
 
     const r1 = await hook({ type: "context", messages: existing }, undefined);
     expect(r1).toBeDefined();
     const msgs1 = r1!.messages as Array<Record<string, unknown>>;
     expect(msgs1).toHaveLength(2);
     expect(msgs1[0]).toBe(existing[0]); // append-only：已有消息原样保留
-    expect(msgs1[1]).toMatchObject({ customType: "memory", display: false });
+    // M02：记忆卡片是 durable 端 pi-ai UserMessage（role:"user" + 字符串 content），非旧 coding-agent 形状。
+    expect(msgs1[1]).toMatchObject({ role: "user", timestamp: expect.any(Number) });
+    expect(typeof (msgs1[1] as { content: unknown }).content).toBe("string");
 
     const nLogs1 = h.db
       .prepare("SELECT count(*) AS n FROM retrieval_log WHERE owner_agent = ? AND trigger_msg_id = ?")
@@ -507,14 +645,14 @@ describe("P3 记忆子系统（§12 / §14 / §16.3）", () => {
       },
     });
 
-    // ambient event 不唤醒（woke:false 也无路径信息），但仍应被观察记录。
+    // ambient event 不唤醒（woke:false），但路径非 P3 → 仍应被观察记录。
     h.fake.emit("message_delivered", {
       envelope: env,
       endpointId: "ep-agent-stu",
       accountId: "acct-stu",
       grade: "silent",
       woke: false,
-      path: "P3",
+      path: "P2",
     });
     await flush();
 
@@ -535,12 +673,87 @@ describe("P3 记忆子系统（§12 / §14 / §16.3）", () => {
     expect(d).toBeUndefined();
   });
 
+  it("R22：设施观察按 dominant_channel 过滤感官通道（视觉型只记视觉片段）", async () => {
+    const visualPolicy: MemoryPolicy = { ...defaultMemoryPolicy(), dominantChannel: "visual" };
+    const h = tracked(setup({ "acct-stu": visualPolicy }));
+    addRole(h.registry, "agent-stu", "acct-stu", "小明");
+
+    const env = envelope("msg-sense", "acct-facility", "中性摘要：实验室此刻很安静", {
+      kind: "event",
+      expect: "none",
+      ext: {
+        virtualTs: "W1D1T9",
+        facilityEvent: {
+          facilities: ["fac-lab"],
+          event: "state_change",
+          state: { lighting: "off", noise: "low" },
+          renderHints: { visual: ["灯突然灭了"], auditory: ["空调嗡嗡响"] },
+          anomalous: false,
+        },
+      },
+    });
+    h.fake.emit("message_delivered", {
+      envelope: env,
+      endpointId: "ep-agent-stu",
+      accountId: "acct-stu",
+      grade: "silent",
+      woke: false,
+      path: "P2",
+    });
+    await flush();
+
+    const ep = episodeOf(h.db, "agent-stu", "msg-sense");
+    expect(ep).toBeDefined();
+    // 视觉型只挑 visual 通道，不把 auditory 串进来（§16.3.2）。
+    expect(ep!.gist).toBe("灯突然灭了");
+  });
+
+  it("P3 静默档连设施观察也零情节（A20）：先按消费档判定，不落 observation episode", async () => {
+    const h = tracked(setup());
+    addRole(h.registry, "agent-stu", "acct-stu", "小明");
+
+    const env = envelope("msg-p3", "acct-facility", "实验室的灯突然灭了", {
+      kind: "event",
+      expect: "none",
+      ext: {
+        virtualTs: "W1D1T9",
+        facilityEvent: {
+          facilities: ["fac-lab"],
+          event: "state_change",
+          state: { lighting: "off" },
+          renderHints: { visual: ["灯突然灭了"] },
+          anomalous: true,
+        },
+      },
+    });
+
+    // P3 = 静默消费档：即使带 facilityEvent，也不落任何情节（§12.1.1 静默零情节 / R21）。
+    h.fake.emit("message_delivered", {
+      envelope: env,
+      endpointId: "ep-agent-stu",
+      accountId: "acct-stu",
+      grade: "silent",
+      woke: true,
+      path: "P3",
+    });
+    await flush();
+
+    const ep = episodeOf(h.db, "agent-stu", "msg-p3");
+    expect(ep).toBeUndefined();
+    const d = decisionOf(h.db, "agent-stu", "msg-p3");
+    expect(d).toBeUndefined();
+    const episodeCount = h.db
+      .prepare("SELECT COUNT(*) AS n FROM episodes WHERE owner_agent = ?")
+      .get("agent-stu") as { n: number };
+    expect(episodeCount.n).toBe(0);
+  });
+
   it("学习队列上下文注入：无记忆卡片时仍注入 transient 卡片（§17.5.2 → §14.1 150-token）", async () => {
     const lqItems: LearningQueueItem[] = [
       { topic: "变力做功", priority: "high", motivation: "上次被考住了" },
       { topic: "牛顿第二定律", priority: "medium", motivation: "推导总搞混" },
     ];
-    const fakeLqK = { learningQueue: (_owner: string) => lqItems } as unknown as KnowledgeService;
+    const fakeLqK = { learningQueue: (_owner: string) => lqItems, summary: () => "" } as unknown as KnowledgeService;
 
     const h = tracked(setup({}, fakeLqK));
     addRole(h.registry, "agent-stu", "acct-stu", "小明");
@@ -561,16 +774,17 @@ describe("P3 记忆子系统（§12 / §14 / §16.3）", () => {
 
     // 无记忆卡片（没有 episode），但 learningQueue 非空 → 仍应注入 transient。
     const hook = h.service.contextHookFor("acct-stu");
-    const existing = [{ role: "user", content: [{ type: "text", text: "已有消息" }] }];
+    const existing = [{ role: "user", content: "已有消息", timestamp: Date.now() }];
 
     const r = await hook({ type: "context", messages: existing }, undefined);
     expect(r).toBeDefined();
     const msgs = r!.messages as Array<Record<string, unknown>>;
     expect(msgs).toHaveLength(2); // existing + transient
     expect(msgs[0]).toBe(existing[0]); // R3: append-only
-    expect(msgs[1]).toMatchObject({ customType: "transient", display: false });
+    // M02：瞬时卡片是 durable 端 UserMessage（role:"user" + 字符串 content）。
+    expect(msgs[1]).toMatchObject({ role: "user", timestamp: expect.any(Number) });
 
-    const content = (msgs[1] as { content: Array<{ text: string }> }).content[0]!.text;
+    const content = (msgs[1] as { content: string }).content;
     expect(content).toContain("<<<INTENT");
     expect(content).toContain("[学习意图]");
     expect(content).toContain("[高] 变力做功");
@@ -588,7 +802,7 @@ describe("P3 记忆子系统（§12 / §14 / §16.3）", () => {
   });
 
   it("学习队列无内容时与无记忆卡片一起返回 undefined（no-op）", async () => {
-    const emptyK = { learningQueue: () => [] as LearningQueueItem[] } as unknown as KnowledgeService;
+    const emptyK = { learningQueue: () => [] as LearningQueueItem[], summary: () => "" } as unknown as KnowledgeService;
     const h = tracked(setup({}, emptyK));
     addRole(h.registry, "agent-stu", "acct-stu", "小明");
 
@@ -619,7 +833,7 @@ describe("P3 记忆子系统（§12 / §14 / §16.3）", () => {
       priority: "low" as const,
       motivation: "这是一个很长的动机描述用于填充token预算直到超出上限触发截断",
     }));
-    const fakeLqK = { learningQueue: (_owner: string) => manyItems } as unknown as KnowledgeService;
+    const fakeLqK = { learningQueue: (_owner: string) => manyItems, summary: () => "" } as unknown as KnowledgeService;
 
     const h = tracked(setup({}, fakeLqK));
     addRole(h.registry, "agent-stu", "acct-stu", "小明");
@@ -643,7 +857,7 @@ describe("P3 记忆子系统（§12 / §14 / §16.3）", () => {
     expect(r).toBeDefined();
     const msgs = r!.messages as Array<Record<string, unknown>>;
     expect(msgs).toHaveLength(1); // only transient, no memory
-    const content = (msgs[0] as { content: Array<{ text: string }> }).content[0]!.text;
+    const content = (msgs[0] as { content: string }).content;
     expect(content).toContain("INTENT>>>");
 
     // Not all 20 items should fit in 150 tokens — verify truncation happened.
@@ -658,5 +872,315 @@ describe("P3 记忆子系统（§12 / §14 / §16.3）", () => {
     expect(log!.tokens_transient).toBeGreaterThan(0);
     // transient budget is 150 tokens — tokens_transient should be ≤ ~200
     expect(log!.tokens_transient).toBeLessThanOrEqual(200);
+  });
+
+  it("R23：无 L1 命中也注入 L2 本人画像/知识/发送者印象 + 实时状态，L2·瞬时·owner 分桶", async () => {
+    const knowledgeSummary =
+      "牛顿第二定律: understood · conf 0.80 · 保持 0.75\n变力做功: fading · conf 0.40 · 保持 0.30";
+    const fakeK = {
+      learningQueue: () => [] as LearningQueueItem[],
+      summary: (_owner: string) => knowledgeSummary,
+    } as unknown as KnowledgeService;
+    const h = tracked(setup({}, fakeK));
+    addRole(h.registry, "agent-stu", "acct-stu", "小明");
+    addRole(h.registry, "agent-tea", "acct-tea", "王老师");
+
+    // L2 数据源：self 画像 + 对发送者（老师）的印象，直接落 subject_profiles（owner=agent-stu）。
+    const now = "2026-01-01T00:00:00.000Z";
+    const insertProfile = (type: string, id: string, impression: string): void => {
+      h.db
+        .prepare(
+          `INSERT INTO subject_profiles
+             (owner_agent, subject_type, subject_id, impression, valence, closeness, trust, episode_count, evidence_json, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 1, '[]', ?)`,
+        )
+        .run("agent-stu", type, id, impression, 0.6, null, null, now);
+    };
+    insertProfile("self", "self", "我是个偏科但好学的学生");
+    insertProfile("person", "agent-tea", "王老师讲题很耐心");
+
+    // 非默认实时状态：自省后情绪兴奋、精力略降。
+    const setState = (key: string, value: unknown): void => {
+      h.db
+        .prepare(`INSERT INTO agent_state (agent_id, key, value_json, updated_at) VALUES (?, ?, ?, ?)`)
+        .run("agent-stu", key, JSON.stringify(value), now);
+    };
+    setState("mood", "兴奋");
+    setState("mood_intensity", 0.9);
+    setState("energy", 0.8);
+
+    const env = envelope("msg-r23", "acct-tea", "这件事与任何记忆都不相干", {
+      to: ["acct-stu"],
+      ext: { virtualTs: "W3D1T14", sceneId: "scene-1", turn: 12 },
+    });
+    h.fake.emit("message_delivered", {
+      envelope: env,
+      endpointId: "ep-agent-stu",
+      accountId: "acct-stu",
+      grade: "steer",
+      woke: true,
+      path: "P1",
+    });
+    await flush();
+
+    const hook = h.service.contextHookFor("acct-stu");
+    const existing = [{ role: "user", content: "已有消息", timestamp: Date.now() }];
+    const r = await hook({ type: "context", messages: existing }, undefined);
+    expect(r).toBeDefined();
+    const msgs = r!.messages as Array<Record<string, unknown>>;
+    // 无 L1 命中仍注入：existing + L2 卡 + 状态卡（瞬时）。次序 L2 → 瞬时。
+    expect(msgs).toHaveLength(3);
+    expect(msgs[0]).toBe(existing[0]); // R3 append-only
+
+    const l2 = (msgs[1] as { content: string }).content;
+    expect(l2).toContain("<<<SELF");
+    expect(l2).toContain("[我的画像与知识]");
+    expect(l2).toContain("自我印象：我是个偏科但好学的学生");
+    expect(l2).toContain("对王老师的印象：王老师讲题很耐心");
+    expect(l2).toContain("牛顿第二定律: understood");
+    expect(l2).toContain("变力做功: fading");
+    expect(l2).toContain("SELF>>>");
+
+    const state = (msgs[2] as { content: string }).content;
+    expect(state).toContain("<<<STATE");
+    expect(state).toContain("[当前状态]");
+    expect(state).toContain("情绪：兴奋");
+    expect(state).toContain("精力：0.80");
+    expect(state).toContain("STATE>>>");
+
+    const log = h.db
+      .prepare("SELECT tokens_l2, tokens_l1, tokens_transient, tokens_total FROM retrieval_log WHERE owner_agent = ?")
+      .get("agent-stu") as
+      | { tokens_l2: number; tokens_l1: number; tokens_transient: number; tokens_total: number }
+      | undefined;
+    expect(log).toBeDefined();
+    expect(log!.tokens_l1).toBe(0); // 无 L1 命中
+    expect(log!.tokens_l2).toBeGreaterThan(0);
+    expect(log!.tokens_l2).toBeLessThanOrEqual(500); // §14.1.2 L2 ≤ 500
+    expect(log!.tokens_transient).toBeGreaterThan(0);
+    expect(log!.tokens_transient).toBeLessThanOrEqual(150); // 瞬时 ≤ 150
+    expect(log!.tokens_total).toBe(log!.tokens_l2 + log!.tokens_l1 + log!.tokens_transient);
+  });
+
+  it("A11：同账号两 delivery 乱序消费按来源消息精确结算（不串来源、不删错轮）", async () => {
+    const h = tracked(setup());
+    addRole(h.registry, "agent-stu", "acct-stu", "小明");
+
+    // 第 1 条投递：msg-a。
+    const envA = envelope("msg-a", "acct-tea", "先讲概念 A", {
+      to: ["acct-stu"],
+      ext: { virtualTs: "W1D1T8", sceneId: "scene-1", turn: 1 },
+    });
+    h.fake.emit("message_delivered", {
+      envelope: envA,
+      endpointId: "ep-agent-stu",
+      accountId: "acct-stu",
+      grade: "steer",
+      woke: true,
+      path: "P1",
+    });
+
+    // 第 2 条投递：msg-b（在 msg-a 未消费前覆盖账号级「当前轮」入口）。
+    const envB = envelope("msg-b", "acct-tea", "再讲概念 B", {
+      to: ["acct-stu"],
+      ext: { virtualTs: "W1D1T8", sceneId: "scene-1", turn: 1 },
+    });
+    h.fake.emit("message_delivered", {
+      envelope: envB,
+      endpointId: "ep-agent-stu",
+      accountId: "acct-stu",
+      grade: "steer",
+      woke: true,
+      path: "P1",
+    });
+    await flush();
+
+    // 乱序消费：先结算 B，再结算 A。
+    h.fake.emit("message_consumed", { envelope: envB, endpointId: "ep-agent-stu", accountId: "acct-stu", partial: false });
+    await flush();
+    h.fake.emit("message_consumed", { envelope: envA, endpointId: "ep-agent-stu", accountId: "acct-stu", partial: false });
+    await flush();
+
+    const rows = h.db
+      .prepare("SELECT source_msg_id, path, write_decided FROM memory_decisions WHERE owner_agent = ? ORDER BY source_msg_id")
+      .all("agent-stu") as Array<{ source_msg_id: string; path: string; write_decided: number }>;
+    // 两条判定各按自己的来源 message 落一行，不双记账、不缺失、不串来源。
+    expect(rows.map((r) => r.source_msg_id)).toEqual(["msg-a", "msg-b"]);
+    expect(rows.every((r) => r.path === "P1")).toBe(true);
+  });
+
+  it("A31：重复 subjectRef 只落一条关系、画像只计一次（episode_count / evidence 去重）", () => {
+    const h = tracked(setup());
+    addRole(h.registry, "agent-stu", "acct-stu", "小明");
+
+    // 同一 (person:tea) 出现两次（不同 role/weight），另有一个独立主体 person:prin。
+    h.dao.insertEpisode({
+      episodeId: "ep-dup",
+      ownerAgent: "agent-stu",
+      kind: "fact",
+      gist: "王老师强调的重点",
+      salience: 0.6,
+      confidence: 0.8,
+      virtualTs: "W1D1T8",
+      virtualHours: 8,
+      retention: 1.0,
+      subjects: [
+        { ref: { type: "person", id: "acct-tea" }, roleInEpisode: "sender", weight: 1.0 },
+        { ref: { type: "person", id: "acct-tea" }, roleInEpisode: "authority", weight: 0.5 },
+        { ref: { type: "person", id: "acct-prin" }, roleInEpisode: "wit", weight: 0.3 },
+      ],
+    });
+
+    // 关系表：重复主体只保留首条（OR IGNORE），共 2 行而非 3 行。
+    const rels = h.db
+      .prepare("SELECT subject_type, subject_id, role_in_episode FROM episode_subjects WHERE episode_id = ? ORDER BY rowid")
+      .all("ep-dup") as Array<{ subject_type: string; subject_id: string; role_in_episode: string }>;
+    expect(rels).toEqual([
+      { subject_type: "person", subject_id: "acct-tea", role_in_episode: "sender" },
+      { subject_type: "person", subject_id: "acct-prin", role_in_episode: "wit" },
+    ]);
+
+    // 画像：acct-tea 的 episode_count 恒为 1，evidence 只含本情节一条——不被重复计入两次。
+    const profile = h.db
+      .prepare(
+        "SELECT episode_count, evidence_json FROM subject_profiles WHERE owner_agent = ? AND subject_type = ? AND subject_id = ?",
+      )
+      .get("agent-stu", "person", "acct-tea") as { episode_count: number; evidence_json: string };
+    expect(profile.episode_count).toBe(1);
+    const evidence = JSON.parse(profile.evidence_json) as Array<{ episode_id: string; weight: number }>;
+    expect(evidence).toEqual([{ episode_id: "ep-dup", weight: 1.0 }]);
+  });
+
+  it("A30：P2 摘要唤醒的 remember 拒绝写 quote（未见原文不产引文证据，P1 才可摘录）", async () => {
+    const h = tracked(setup());
+    addRole(h.registry, "agent-stu", "acct-stu", "小明");
+    addRole(h.registry, "agent-tea", "acct-tea", "王老师");
+
+    const env = envelope("msg-p2", "acct-tea", "上次讲的内容（摘要视图）", {
+      to: ["acct-stu"],
+      ext: { virtualTs: "W1D1T8", sceneId: "scene-1", turn: 1 },
+    });
+    h.fake.emit("message_delivered", {
+      envelope: env,
+      endpointId: "ep-agent-stu",
+      accountId: "acct-stu",
+      grade: "silent",
+      woke: true,
+      path: "P2",
+    });
+    await flush();
+
+    const tools = await h.service.domainHandlersFor("acct-stu");
+    const remember = tools.remember as unknown as SimpleTool;
+    const rejected = await remember("tc-1", { gist: "老师说过一句话", quote: "这句话是精确原文" });
+    expect(JSON.parse(rejected.content as string)).toMatchObject({ error: { code: "ARG_INVALID" } });
+    expect(episodeOf(h.db, "agent-stu", "msg-p2")).toBeUndefined();
+
+    // 正向：P1（原文可见）带 quote 是合法的。
+    const envP1 = envelope("msg-p1", "acct-tea", "精确原文可见", {
+      to: ["acct-stu"],
+      ext: { virtualTs: "W1D1T8", sceneId: "scene-1", turn: 2 },
+    });
+    h.fake.emit("message_delivered", {
+      envelope: envP1,
+      endpointId: "ep-agent-stu",
+      accountId: "acct-stu",
+      grade: "steer",
+      woke: true,
+      path: "P1",
+    });
+    await flush();
+    const tools2 = await h.service.domainHandlersFor("acct-stu");
+    const accepted = await (tools2.remember as unknown as SimpleTool)("tc-2", {
+      gist: "老师说了句重话",
+      quote: "这句是精确原文",
+    });
+    expect(JSON.parse(accepted.content as string)).toMatchObject({ ok: true });
+  });
+
+  it("A29：主体候选通道——同一人物、措辞不同也能召回（FTS 精确短语召回缺失的兜底）", () => {
+    const h = tracked(setup());
+    // 旧记忆：gist 措辞与查询完全无关，但挂在 person:stu-1 主体上。
+    h.dao.insertEpisode({
+      episodeId: "ep-subject",
+      ownerAgent: "agent-stu",
+      kind: "event",
+      gist: "他在篮球场上崴了脚",
+      salience: 0.7,
+      confidence: 0.8,
+      virtualTs: "W1D1T8",
+      virtualHours: 8,
+      retention: 0.7,
+      status: "active",
+      subjects: [{ ref: { type: "person", id: "stu-1" } }],
+    });
+    // 另一条挂在无关 person 上的记忆，不应被主体候选召回。
+    h.dao.insertEpisode({
+      episodeId: "ep-other",
+      ownerAgent: "agent-stu",
+      kind: "event",
+      gist: "运动会安排在周末",
+      salience: 0.7,
+      confidence: 0.8,
+      virtualTs: "W1D1T8",
+      virtualHours: 8,
+      retention: 0.7,
+      status: "active",
+      subjects: [{ ref: { type: "person", id: "other" } }],
+    });
+
+    // FTS 文本候选：措辞完全不同的自然语言进精确短语 → 命不中旧 gist（A29 的缺口本身）。
+    const textCandidates = h.dao.searchCandidates("agent-stu", "他上周在学校里表现得怎么样", false);
+    expect(textCandidates.map((c) => c.episodeId)).not.toContain("ep-subject");
+
+    // 主体候选通道：在场 person:stu-1 → 同一人物的情节被捞回候选面（关系表反查，非向量检索）。
+    const subjectCandidates = h.dao.searchCandidatesBySubjects(
+      "agent-stu",
+      [{ type: "person", id: "stu-1" }],
+      false,
+    );
+    expect(subjectCandidates.map((c) => c.episodeId)).toContain("ep-subject");
+    expect(subjectCandidates.map((c) => c.episodeId)).not.toContain("ep-other");
+
+    // self 是 owner 自聚焦兜底、范围过宽，不在主体候选通道（DAO 内部排除）。
+    const selfOnly = h.dao.searchCandidatesBySubjects("agent-stu", [{ type: "self", id: "self" }], false);
+    expect(selfOnly).toHaveLength(0);
+  });
+});
+
+describe("R22 衰减 τ/growth 全链（§15.1 decaySweep）", () => {
+  it("negativeBias 放大负面 τ、arousal 放大 τ：同 salience 同时长下负面/高唤醒衰减更慢", () => {
+    const h = tracked(setup());
+    const policy = { ...defaultMemoryPolicy(), negativeBias: 2, tau0Hours: 10 };
+
+    const base = {
+      ownerAgent: "agent-stu",
+      kind: "event",
+      salience: 1,
+      confidence: 0.8,
+      virtualTs: "W1D1T0",
+      virtualHours: 0,
+      retention: 1,
+      status: "active" as const,
+      subjects: [{ ref: { type: "self" as const, id: "self" } }],
+    };
+    h.dao.insertEpisode({ ...base, episodeId: "ep-neg", gist: "负面", valence: -0.8, arousal: 0.5 });
+    h.dao.insertEpisode({ ...base, episodeId: "ep-pos", gist: "正面", valence: 0.8, arousal: 0.5 });
+    h.dao.insertEpisode({ ...base, episodeId: "ep-aro", gist: "高唤醒", valence: 0, arousal: 0.9 });
+    h.dao.insertEpisode({ ...base, episodeId: "ep-calm", gist: "平静", valence: 0, arousal: 0.1 });
+
+    h.dao.decaySweep("agent-stu", 10, policy);
+
+    const retentionOf = (id: string): number =>
+      (h.db.prepare("SELECT retention FROM episodes WHERE episode_id = ?").get(id) as { retention: number })
+        .retention;
+
+    // τ = tau0Hours · (1+0.5·rehearsal) · (1+arousal) · (1+negativeBias·[valence<0])
+    // negativeBias=2：负面 τ 更大 → 比正面衰减慢；arousal 越高 τ 越大 → 衰减越慢。
+    expect(retentionOf("ep-neg")).toBeGreaterThan(retentionOf("ep-pos"));
+    expect(retentionOf("ep-aro")).toBeGreaterThan(retentionOf("ep-calm"));
+    // 便于复核具体数值仍落在 (0,1) 且舍入后不相等（避免浮点误判相等）。
+    expect(retentionOf("ep-neg")).toBeCloseTo(Math.exp(-10 / 45), 4);
+    expect(retentionOf("ep-aro")).toBeCloseTo(Math.exp(-10 / 19), 4);
   });
 });

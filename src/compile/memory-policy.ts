@@ -54,6 +54,22 @@ function gain(trait: number): number {
 }
 
 /**
+ * `narrative_voice.sensory.dominant_channel` → renderHints 通道 key（§16.3.2）。
+ * 蓝本常写中文字面量（「视觉」「听觉」「触觉」「嗅觉」），renderHints 键是英文；
+ * 这里兼容两种拼写，归一到英文 key。未知值 → undefined（退化为中性串接）。
+ */
+const SENSORY_CHANNEL_ALIAS: Record<string, "visual" | "auditory" | "tactile" | "olfactory"> = {
+  visual: "visual",
+  auditory: "auditory",
+  tactile: "tactile",
+  olfactory: "olfactory",
+  视觉: "visual",
+  听觉: "auditory",
+  触觉: "tactile",
+  嗅觉: "olfactory",
+};
+
+/**
  * 编译记忆策略（§12.2 映射表）。`base` 提供中性基线，缺省 defaultMemoryPolicy()。
  * 每个输出字段只被「存在」的模板字段改写：模板没写 big_five ⇒ 全部保持基线，
  * 所以蓝本里只有 `personality` 时，师资与学生的差异自然为零——差异由模板数据驱动。
@@ -105,6 +121,12 @@ export function compileMemoryPolicy(
   // —— 情绪 / 衰减 ——
   p.arousalGain = gain(neuroticism); // 神经质 ↑ ⇒ 情绪放大
   p.negativeBias = gain(neuroticism); // 神经质 ↑ ⇒ 负面事件记得更牢更久
+
+  // —— 设施观察感官通道（§16.3.2 / R22）：narrative_voice.sensory.dominant_channel ——
+  const dominantChannel = pick(nv, "sensory", "dominant_channel");
+  if (typeof dominantChannel === "string") {
+    p.dominantChannel = SENSORY_CHANNEL_ALIAS[dominantChannel.trim()];
+  }
 
   // —— 认知（注意力分散）——
   if (scattered) {

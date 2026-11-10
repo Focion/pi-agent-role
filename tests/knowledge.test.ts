@@ -156,6 +156,34 @@ describe("P5 知识状态机（§17.1/§17.2）", () => {
     expect(row.wrong_belief).toContain("摩擦力");
   });
 
+  it("R27 纠正裁决：误区 1→0 返回 misconceptionCorrected；置误区（0→1）不返回", () => {
+    const { svc } = setup(["ag-teacher-01"]);
+    svc.applyUpdate("ag-stu", proposal("kn:j", "heard", "mentioned"), { virtualTs: "W1D1T8" });
+    svc.applyUpdate("ag-stu", proposal("kn:j", "applied", "solved"), { virtualTs: "W1D1T9" });
+
+    // 置误区（0→1）：corrected 证据触发 T11，不触发纠正情节。
+    const setMiss = svc.applyUpdate(
+      "ag-stu",
+      proposal("kn:j", "understood", "corrected", { wrongBelief: "旧的错误理解", taughtBy: "person:ag-teacher-01" }),
+      { virtualTs: "W1D2T8" },
+    );
+    expect(setMiss).toMatchObject({ ok: true });
+    expect(setMiss.ok && setMiss.misconceptionCorrected).toBeUndefined();
+
+    // 纠正（1→0）：T3 understood→applied + isMisconception:false 清误区 → 裁决带纠正载荷。
+    const corr = svc.applyUpdate(
+      "ag-stu",
+      proposal("kn:j", "applied", "solved", { isMisconception: false, taughtBy: "person:ag-teacher-01" }),
+      { virtualTs: "W1D2T9" },
+    );
+    expect(corr).toMatchObject({ ok: true, to: "applied" });
+    expect(corr.ok && corr.misconceptionCorrected).toMatchObject({
+      topic: "kn:j",
+      corrector: "person:ag-teacher-01",
+      wrongBelief: "旧的错误理解",
+    });
+  });
+
   it("evidenceEpisode：不存在 / 不属于 owner 的区分", () => {
     const { db, svc } = setup(["ag-teacher-01"]);
     addEpisode(db, "ep-1", "ag-teacher-01");
@@ -225,6 +253,54 @@ describe("P5 知识衰减（§17.5.1）", () => {
     expect(events.every((e) => e.evidence_kind === "decay")).toBe(true);
   });
 
+  it("A32 同 now 重复衰减幂等：不会因二次扫描换小 factor 把 fading 再压到 forgotten", () => {
+    const { db, svc } = setup();
+    svc.seedFromTemplate("ag-stu", [{ topic: "kn:once", claim: "x" }]);
+    db.prepare("UPDATE knowledge_items SET mastery = 'mastered', last_practiced_vhours = 0 WHERE owner_agent = 'ag-stu'").run();
+
+    // mastered factor=4, use_count=0 ⇒ τ=400。dt=600 → retention=exp(-1.5)=0.223 ∈ (0.10,0.35)。
+    const first = svc.decay("ag-stu", 600, 100);
+    expect(first.newlyFading).toHaveLength(1);
+    expect(first.newlyForgotten).toHaveLength(0);
+
+    // 同一虚拟小时再扫一次：幂等跳过，不再用 fading 的 factor=1 重算（否则 retention≈0.0025 会 forgotten）。
+    const again = svc.decay("ag-stu", 600, 100);
+    expect(again.newlyFading).toHaveLength(0);
+    expect(again.newlyForgotten).toHaveLength(0);
+
+    const row = db.prepare("SELECT mastery, decay_from, last_decay_vhours FROM knowledge_items WHERE owner_agent = 'ag-stu'").get() as {
+      mastery: string;
+      decay_from: string | null;
+      last_decay_vhours: number | null;
+    };
+    expect(row.mastery).toBe("fading");
+    expect(row.decay_from).toBe("mastered");
+    expect(row.last_decay_vhours).toBe(600);
+  });
+
+  it("A14 fading 恢复晋级封顶 = 衰减前状态，恢复后清空 decay_from", () => {
+    const { db, svc } = setup();
+    svc.seedFromTemplate("ag-stu", [{ topic: "kn:cap", claim: "x" }]);
+    db.prepare("UPDATE knowledge_items SET mastery = 'applied', last_practiced_vhours = 0 WHERE owner_agent = 'ag-stu'").run();
+
+    // applied factor=2 ⇒ τ=200。dt=400 → retention=exp(-2)=0.135 < 0.35 → fading，decay_from=applied。
+    const d = svc.decay("ag-stu", 400, 100);
+    expect(d.newlyFading).toHaveLength(1);
+    expect(db.prepare("SELECT decay_from FROM knowledge_items WHERE owner_agent = 'ag-stu'").get()).toMatchObject({ decay_from: "applied" });
+
+    // 自省提议一句 mentioned 直接 mastered：只能恢复到 applied，不能跳 mastered。
+    const verdict = svc.applyUpdate("ag-stu", proposal("kn:cap", "mastered", "mentioned"), { virtualTs: "W2D1T8" });
+    expect(verdict).toMatchObject({ ok: true, to: "applied" });
+
+    const row = db.prepare("SELECT mastery, decay_from FROM knowledge_items WHERE owner_agent = 'ag-stu'").get() as { mastery: string; decay_from: string | null };
+    expect(row).toMatchObject({ mastery: "applied", decay_from: null }); // 恢复后清空基线
+
+    // 更保守的恢复（只回到 heard）原样放行。
+    db.prepare("UPDATE knowledge_items SET mastery = 'fading', decay_from = 'applied' WHERE owner_agent = 'ag-stu'").run();
+    const conservative = svc.applyUpdate("ag-stu", proposal("kn:cap", "heard", "mentioned"), { virtualTs: "W2D1T9" });
+    expect(conservative).toMatchObject({ ok: true, to: "heard" });
+  });
+
   it("T10 forgotten→heard 重新接触", () => {
     const { db, svc } = setup();
     svc.seedFromTemplate("ag-stu", [{ topic: "kn:reboot", claim: "x" }]);
@@ -237,10 +313,10 @@ describe("P5 知识衰减（§17.5.1）", () => {
 });
 
 describe("P5 学习队列（§17.5.2）", () => {
-  it("Q4 误区自动入队（high + 系统模糊动机）；Q1 掌握出队；Q3 封顶 7", () => {
+  it("Q4 误区自动入队（high + 系统模糊动机）；Q1 掌握出队（误区除外）；Q3 封顶 7", () => {
     const { db, svc } = setup();
 
-    // 两个误区，一个已 applied（Q1 出队），一个 heard 仍留队。
+    // 两个误区，一个已 applied（A33：误区不因 applied 出队），一个 heard 留队。
     db.prepare(
       `INSERT INTO knowledge_items (kn_id, owner_agent, topic, claim, mastery, confidence, retention, practice_count, is_misconception, taught_by, source_kind, first_seen_at, updated_at)
        VALUES ('kn-a','ag-stu','kn:mis-a','x','applied',0.5,1,0,1,'self','inferred','2026-01-01','2026-01-01'),
@@ -248,7 +324,7 @@ describe("P5 学习队列（§17.5.2）", () => {
               ('kn-c','ag-stu','kn:done','z','mastered',0.5,1,0,0,'self','inferred','2026-01-01','2026-01-01')`,
     ).run();
 
-    // 模型还提议了几条 low：其中一条撞上已 applied（应出队），一条撞上误区（high 覆盖 low）。
+    // 模型还提议了几条 low：其中一条撞上已 applied 的误区（high 覆盖 low、且不出队），一条新题。
     const queue = svc.organizeLearningQueue("ag-stu", [
       { topic: "kn:mis-a", priority: "low", motivation: "想再练练" },
       { topic: "kn:extra", priority: "low", motivation: "竞赛要考" },
@@ -256,8 +332,10 @@ describe("P5 学习队列（§17.5.2）", () => {
 
     const topics = queue.map((q) => q.topic);
     expect(topics).toContain("kn:mis-b"); // Q4 自动入队（high）
-    expect(topics).not.toContain("kn:mis-a"); // Q1：applied 出队
-    expect(topics).not.toContain("kn:done"); // 本来就是 mastered
+    expect(topics).toContain("kn:mis-a"); // A33：仍是误区，applied 不出队
+    expect(topics).not.toContain("kn:done"); // 本来就 mastered 且非误区
+    const misA = queue.find((q) => q.topic === "kn:mis-a")!;
+    expect(misA.priority).toBe("high"); // high 覆盖模型的 low
     const misB = queue.find((q) => q.topic === "kn:mis-b")!;
     expect(misB.priority).toBe("high");
     expect(misB.motivation).toBe("我好像哪里没搞对"); // 系统模糊语，不含 wrong_belief
@@ -270,16 +348,40 @@ describe("P5 学习队列（§17.5.2）", () => {
 
   it("learningQueue 存/取：写入 reflections.output_json 后读回最新一条", () => {
     const { db, svc } = setup();
-    const insert = (startedAt: string, json: unknown): void => {
+    const insert = (startedAt: string, json: unknown, status = "done"): void => {
       db.prepare(
         `INSERT INTO reflections (reflection_id, owner_agent, trigger, status, started_at, output_json)
-         VALUES (?, 'ag-stu', 'manual', 'done', ?, ?)`,
-      ).run(`rf-${startedAt}`, startedAt, JSON.stringify(json));
+         VALUES (?, 'ag-stu', 'manual', ?, ?, ?)`,
+      ).run(`rf-${startedAt}`, status, startedAt, JSON.stringify(json));
     };
     insert("2026-01-01T00:00:00.000Z", { learningQueue: [{ topic: "kn:want", priority: "high", motivation: "上次被问住了" }] });
     insert("2026-01-02T00:00:00.000Z", { learningQueue: [{ topic: "kn:newer", priority: "low", motivation: "想搞懂" }] });
 
     const q = svc.learningQueue("ag-stu");
     expect(q).toEqual([{ topic: "kn:newer", priority: "low", motivation: "想搞懂" }]); // 最新一条
+  });
+
+  it("A34 模型省略 learningQueue 时继承上轮队列，非误区待办不消失", () => {
+    const { db, svc } = setup();
+    db.prepare(
+      `INSERT INTO reflections (reflection_id, owner_agent, trigger, status, started_at, output_json)
+       VALUES ('rf-prev', 'ag-stu', 'manual', 'done', '2026-01-01T00:00:00.000Z', ?)`,
+    ).run(JSON.stringify({ learningQueue: [{ topic: "kn:pending", priority: "low", motivation: "上次被问住了" }] }));
+
+    // 本轮模型省略 learningQueue（传空数组）：继承上轮的 kn:pending。
+    const q = svc.organizeLearningQueue("ag-stu", []);
+    expect(q).toContainEqual({ topic: "kn:pending", priority: "low", motivation: "上次被问住了" });
+  });
+
+  it("A35 lastLearningQueue 只看 done 反射，failed 的 {error} 不被误当最新队列", () => {
+    const { db, svc } = setup();
+    db.prepare(
+      `INSERT INTO reflections (reflection_id, owner_agent, trigger, status, started_at, output_json)
+       VALUES ('rf-failed', 'ag-stu', 'manual', 'failed', '2026-01-03T00:00:00.000Z', ?),
+              ('rf-done', 'ag-stu', 'manual', 'done', '2026-01-02T00:00:00.000Z', ?)`,
+    ).run(JSON.stringify({ error: "模型超时" }), JSON.stringify({ learningQueue: [{ topic: "kn:want", priority: "high", motivation: "上次被问住了" }] }));
+
+    const q = svc.learningQueue("ag-stu");
+    expect(q).toEqual([{ topic: "kn:want", priority: "high", motivation: "上次被问住了" }]);
   });
 });

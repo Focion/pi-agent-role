@@ -111,6 +111,12 @@ export interface CostView {
   window: { since: string; until: string };
   windowClampedTo: { since: string; until: string };
   scope: { sceneIds: string[] | "all"; agentIds: string[] | "all" };
+  /**
+   * 每段实际应用的 scope / 不可得量声明（R35）。三段各自能支持的过滤范围不同：
+   * roleOnly 只有 agentIds ∩ 时间窗（mesh 投递层无 sceneId），retrieval / reflection
+   * 有 agentIds ∩ sceneIds ∩ 时间窗，scene 累计量只有 sceneIds（生命周期累计、不进时间窗）。
+   */
+  caveats: string[];
 
   /** mesh 层：原样展示计数器值 + 派生指标。 */
   meshCounters: {
@@ -147,7 +153,8 @@ export interface CostView {
   /** 本环归一读数（本环口径，勿与 mesh 目标对比），来自 §20.2.3。 */
   roleNormalized: {
     turns: number;
-    utteranceMessages: number;
+    /** 发言消息数：需 mesh 事件流精确区分 cue/发言，当前不可得（null，不以 0 占位）。 */
+    utteranceMessages: number | null;
     verbatimPerTurn: number | null;
     verbatimPerUtterance: number | null;
     audiencePerUtterance: number | null;
@@ -171,9 +178,10 @@ export interface CostView {
       episodesWritten: number;
       profilesTouched: number;
       wallMsTotal: number;
-      meshMessages: number;
-      meshDeliveries: number;
-      meshWakes: number;
+      /** 需 mesh 事件流（消息/投递/唤醒归因），当前不可得（null，不以 0 占位）。 */
+      meshMessages: number | null;
+      meshDeliveries: number | null;
+      meshWakes: number | null;
     };
     sceneBudget: {
       tokenBudget: number | null;

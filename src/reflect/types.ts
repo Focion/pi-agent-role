@@ -113,7 +113,8 @@ export interface ReflectionOutput {
   selfInsights?: SelfInsight[];
   knowledgeUpdates?: KnowledgeUpdate[];
   stateAdjust?: StateAdjust;
-  openQuestions?: unknown[];
+  /** 本轮仍未澄清、留给下次自省继续思考的问题（§13.4.1 旧问题连续，R17）。 */
+  openQuestions?: string[];
   /** 留给下次的学习意图（§17.5.2 第 6 项）。服务层整理后存 output_json。 */
   learningQueue?: LearningQueueItem[];
 }
@@ -151,6 +152,10 @@ export interface ReflectionInput {
     episodeCount: number;
   }>;
   knowledgeSummary: string;
+  /** 上一轮留下的学习队列（§17.5.2）：模型应继续处理的问题（A22 完整可引用输入）。 */
+  learningQueue?: LearningQueueItem[];
+  /** 上一轮仍未澄清的问题（§13.4.1 旧问题连续，R17）。 */
+  openQuestions?: string[];
   currentState: { mood: string; moodIntensity: number; energy: number };
   /** 仅 pre_compaction 档：即将被压缩、尚未入记忆的角色消息（§15.4 抢救提炼）。 */
   preCompactMessages?: Array<{ msgId: string; text: string }>;
@@ -167,6 +172,13 @@ export interface ReflectionRunResult {
   decayed?: number;
   /** 未发送的原因（无 reflect 流 / 无情节等）。 */
   skipped?: string;
+  /**
+   * 仅 pre_compaction 档（harvest）：有界等待 reflect_result 落地后的结果。
+   *   · true  —— 自省流已回传并落地（提炼完成，来源已记为已消化）；
+   *   · false —— 超过 resultTimeoutMs 仍未落地（cue 已在途，稍后仍会异步落地，不吞错）。
+   * 非 pre_compaction 档保持 undefined（run 仍是 fire-and-forget 语义，§15.4/R20）。
+   */
+  settled?: boolean;
 }
 
 /** subject_profiles 一行（DAO 反查快照）。 */
@@ -185,6 +197,13 @@ export interface ReflectionApplyResult {
   /** 知识迁移：接受的条数（§13.4.3 ⑦ 只回计数，不回原因）。 */
   knowledgeAccepted: number;
   knowledgeRejected: number;
+}
+
+/** R34：自省流账号的累计用量快照（镜像 pi-backend 的 UsageBreakdown，形状在此分离）。 */
+export interface UsageSnapshot {
+  tokensIn: number;
+  tokensOut: number;
+  totalTokens: number;
 }
 
 /** ReflectApi.read 的快照。 */

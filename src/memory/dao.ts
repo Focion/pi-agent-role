@@ -13,8 +13,10 @@ import type Database from "better-sqlite3";
 
 import type { SubjectRef } from "./subject.js";
 import { DISTORTION_THRESHOLDS, RETRIEVAL } from "./constants.js";
+import { PURPOSE_RETRIEVAL_LIMIT } from "./purpose.js";
 import { newId } from "../runtime/id.js";
 import type { MemoryPolicy } from "../compile/types.js";
+import { modelConfigHashFromJson } from "../compile/fingerprint.js";
 
 /** 一条待写入的情节记忆（与 episodes 列一一对应；subjects 走 episode_subjects）。 */
 export interface EpisodeWrite {
@@ -91,6 +93,31 @@ export interface DecaySweepResult {
 
 const clamp01 = (x: number): number => (x < 0 ? 0 : x > 1 ? 1 : x);
 
+/** episodes 行 + 显式 bm25 → EpisodeCandidate（searchCandidates 与主体候选共用）。 */
+function rowToCandidate(r: Record<string, unknown>, bm25: number): EpisodeCandidate {
+  return {
+    episodeId: r.episode_id as string,
+    ownerAgent: r.owner_agent as string,
+    kind: r.kind as string,
+    sceneId: (r.scene_id as string | null) ?? null,
+    purposeKind: (r.purpose_kind as string | null) ?? null,
+    gist: r.gist as string,
+    detail: (r.detail as string | null) ?? null,
+    quote: (r.quote as string | null) ?? null,
+    emotion: (r.emotion as string | null) ?? null,
+    valence: (r.valence as number | null) ?? null,
+    arousal: (r.arousal as number | null) ?? null,
+    salience: r.salience as number,
+    confidence: r.confidence as number,
+    virtualTs: (r.virtual_ts as string | null) ?? null,
+    virtualHours: r.virtual_hours as number,
+    rehearsalCount: r.rehearsal_count as number,
+    retention: r.retention as number,
+    status: r.status as "active" | "faded" | "consolidated",
+    bm25,
+  };
+}
+
 export class MemoryDao {
   private readonly db: Database.Database;
   private readonly nowReal: () => string;
@@ -98,6 +125,24 @@ export class MemoryDao {
   constructor(db: Database.Database, opts: { nowReal: () => string }) {
     this.db = db;
     this.nowReal = opts.nowReal;
+  }
+
+  /** 写时刻该 agent 的定稿模型配置哈希（R06 E09）；agent 无 model_config_json 时返回 null。 */
+  private configHashFor(owner: string): string | null {
+    const row = this.db
+      .prepare<[string], { model_config_json: string | null }>(
+        `SELECT model_config_json FROM agents WHERE agent_id = ?`,
+      )
+      .get(owner);
+    return modelConfigHashFromJson(row?.model_config_json ?? null);
+  }
+
+  /** agent 的实际角色名（agents.role，进打分 authorityWeights 键）；无角色返回 null。 */
+  roleOfAgent(agentId: string): string | null {
+    const row = this.db
+      .prepare<[string], { role: string | null }>(`SELECT role FROM agents WHERE agent_id = ?`)
+      .get(agentId);
+    return row?.role ?? null;
   }
 
   // ─── episodes + episode_subjects ──────────────────────────────────────────
@@ -146,9 +191,16 @@ export class MemoryDao {
         realTs: this.nowReal(),
         retention: w.retention,
         status: w.status ?? "active",
-        modelConfigHash: w.modelConfigHash ?? null,
+        modelConfigHash: w.modelConfigHash ?? this.configHashFor(w.ownerAgent),
       });
+      // A31：episode_subjects 用 INSERT OR IGNORE，重复 subjectRef 只落一条关系；
+      // 画像 episode_count/evidence 必须按 (type,id) 去重后只 bump 一次，
+      // 否则同一情节被同一主体重复计入。保留首次出现的 role/weight（与 OR IGNORE 语义一致）。
+      const seen = new Set<string>();
       for (const s of w.subjects) {
+        const key = `${s.ref.type}:${s.ref.id}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
         insertSubject.run({
           episodeId: w.episodeId,
           type: s.ref.type,
@@ -223,6 +275,28 @@ export class MemoryDao {
       .get(owner, ref.type, ref.id);
   }
 
+  /** 当前情绪/精力（agent_state，§14.1 瞬时上下文 R23）。缺失回默认，保证字段完整。 */
+  currentState(owner: string): { mood: string; moodIntensity: number; energy: number } {
+    const get = (key: string): unknown => {
+      const row = this.db
+        .prepare<[string, string], { value_json: string }>(
+          `SELECT value_json FROM agent_state WHERE agent_id = ? AND key = ?`,
+        )
+        .get(owner, key);
+      if (!row) return undefined;
+      try {
+        return JSON.parse(row.value_json);
+      } catch {
+        return undefined;
+      }
+    };
+    return {
+      mood: typeof get("mood") === "string" ? (get("mood") as string) : "中性",
+      moodIntensity: typeof get("mood_intensity") === "number" ? (get("mood_intensity") as number) : 0.5,
+      energy: typeof get("energy") === "number" ? (get("energy") as number) : 0.5,
+    };
+  }
+
   // ─── episodes 溯源反查 ──────────────────────────────────────────────────
 
   /**
@@ -238,6 +312,36 @@ export class MemoryDao {
         )
         .get(owner, sourceMsgId) !== undefined
     );
+  }
+
+  /**
+   * 该 source_msg_id 是否已被某次 pre_compaction 提炼消化（§15.4 H2 / A23）。
+   * 与 hasEpisodeFor 互补：压缩提炼常把多条原文合并成少量「自我洞察」情节，
+   * episodes.source_msg_id 是单列、点不出完整范围，故来源消化单独记台账。harvest 去重
+   * 用「两者皆无」才判未消化，否则一次成功提炼后重复 compaction 会再落一遍情节。
+   */
+  hasDistilledSource(owner: string, sourceMsgId: string): boolean {
+    return (
+      this.db
+        .prepare<[string, string], { n: number }>(
+          `SELECT 1 AS n FROM compact_distilled WHERE owner_agent = ? AND source_msg_id = ?`,
+        )
+        .get(owner, sourceMsgId) !== undefined
+    );
+  }
+
+  /** 一次成功提炼后，把该批次的全部来源消息记为已消化（幂等 by (owner, source_msg_id)）。 */
+  markDistilledSources(owner: string, sourceMsgIds: readonly string[], reflectionId: string): void {
+    if (sourceMsgIds.length === 0) return;
+    const upsert = this.db.prepare(`
+      INSERT OR IGNORE INTO compact_distilled (owner_agent, source_msg_id, reflection_id, distilled_at)
+      VALUES (?, ?, ?, ?)
+    `);
+    const at = this.nowReal();
+    const tx = this.db.transaction((ids: readonly string[]) => {
+      for (const id of ids) upsert.run(owner, id, reflectionId, at);
+    });
+    tx(sourceMsgIds);
   }
 
   // ─── memory_decisions（幂等键 + B 模式工作队列）──────────────────────────
@@ -307,7 +411,7 @@ export class MemoryDao {
    * bm25 为负值。默认只召回 `active`；`includeFaded` 打开时把 faded/consolidated
    * 一并纳入（强线索通路，§14.2.4），最终分数再乘 penalty。
    */
-  searchCandidates(owner: string, query: string, includeFaded: boolean, limit = RETRIEVAL.candidateLimit): EpisodeCandidate[] {
+  searchCandidates(owner: string, query: string, includeFaded: boolean, limit: number = RETRIEVAL.candidateLimit): EpisodeCandidate[] {
     const phrase = `"${query.replace(/"/g, '""')}"`;
     // statusClause 只由布尔参数控制取值（字符串常量内联，不受查询文本影响），无注入面。
     const statusClause = includeFaded ? "(e.status = 'active' OR e.status = 'faded' OR e.status = 'consolidated')" : "e.status = 'active'";
@@ -324,27 +428,47 @@ export class MemoryDao {
         LIMIT ?`,
     );
     const out = stmt.all(phrase, owner, limit) as unknown as Array<Record<string, unknown>>;
-    return out.map((r) => ({
-      episodeId: r.episode_id as string,
-      ownerAgent: r.owner_agent as string,
-      kind: r.kind as string,
-      sceneId: (r.scene_id as string | null) ?? null,
-      purposeKind: (r.purpose_kind as string | null) ?? null,
-      gist: r.gist as string,
-      detail: (r.detail as string | null) ?? null,
-      quote: (r.quote as string | null) ?? null,
-      emotion: (r.emotion as string | null) ?? null,
-      valence: (r.valence as number | null) ?? null,
-      arousal: (r.arousal as number | null) ?? null,
-      salience: r.salience as number,
-      confidence: r.confidence as number,
-      virtualTs: (r.virtual_ts as string | null) ?? null,
-      virtualHours: r.virtual_hours as number,
-      rehearsalCount: r.rehearsal_count as number,
-      retention: r.retention as number,
-      status: r.status as "active" | "faded" | "consolidated",
-      bm25: r.bm25 as number,
-    }));
+    return out.map((r) => rowToCandidate(r, r.bm25 as number));
+  }
+
+  /**
+   * 主体候选（A29）：episode_subjects 命中任一在场主体的情节，作为 FTS 文本候选的补充。
+   *
+   * 整条自然语言消息被 FTS 当精确短语匹配时，同一人物/场所而措辞不同的旧 gist 不会命中，
+   * 之后的主体排序「无可排序」——但主体标签在 episode_subjects 里可索引，据此把相关情节捞回候选。
+   * 这不是换成向量检索：仍走关系表 + 二分键，只是把召回面从「文本逐字」扩到「主体相同」。
+   * self 主体是 owner 自洞察的兜底标签、范围过宽，不参与本候选通道（会每轮捞回全部 self 情节）。
+   * bm25 记 0（中性）、最终排序主要靠 subjectMatch（§14.2.1 权重 0.20）。
+   */
+  searchCandidatesBySubjects(
+    owner: string,
+    subjects: readonly SubjectRef[],
+    includeFaded: boolean,
+    limit = RETRIEVAL.candidateLimit,
+  ): EpisodeCandidate[] {
+    const parsed = subjects.filter((s) => s.type !== "self");
+    if (parsed.length === 0) return [];
+    const statusClause = includeFaded
+      ? "(e.status = 'active' OR e.status = 'faded' OR e.status = 'consolidated')"
+      : "e.status = 'active'";
+    const matchClause = parsed.map(() => `(es.subject_type = ? AND es.subject_id = ?)`).join(" OR ");
+    const args: string[] = [];
+    for (const s of parsed) args.push(s.type, s.id);
+    const stmt = this.db.prepare(
+      `SELECT e.episode_id, e.owner_agent, e.kind, e.scene_id, e.purpose_kind,
+              e.gist, e.detail, e.quote, e.emotion, e.valence, e.arousal,
+              e.salience, e.confidence, e.virtual_ts, e.virtual_hours, e.rehearsal_count,
+              e.retention, e.status
+         FROM episodes e
+        WHERE e.owner_agent = ?
+          AND ${statusClause}
+          AND EXISTS (SELECT 1 FROM episode_subjects es
+                       WHERE es.episode_id = e.episode_id AND (${matchClause}))
+        ORDER BY e.retention DESC, e.virtual_hours DESC
+        LIMIT ?`,
+    );
+    const rows = stmt.all(owner, ...args, limit) as unknown as Array<Record<string, unknown>>;
+    return rows.map((r) => rowToCandidate(r, 0));
   }
 
   /** 一批 episode 的主体集合（subjectMatch 用）。 */
@@ -365,6 +489,86 @@ export class MemoryDao {
       map.set(r.episode_id, list);
     }
     return map;
+  }
+
+  // ─── 用途（purpose_kind）检索与重复检测（§17.6）────────────────────────────
+
+  /**
+   * 最近 N 条某用途情节的 knowledge 主体 id（按情节分组、时间倒序）。
+   * 教学进度重复检测用：把本情节的 knowledge 主体与每条的 knowledge 主体求交，
+   * 命中条数即「已重复 N 次」（不承诺模型绝不重复，只呈现事实）。
+   */
+  recentPurposeKnowledgeSubjects(
+    owner: string,
+    purposeKind: string,
+    limit: number,
+  ): Array<{ episodeId: string; knowledgeIds: string[] }> {
+    const eps = this.db
+      .prepare<[string, string, number], { episode_id: string }>(
+        `SELECT episode_id FROM episodes
+         WHERE owner_agent = ? AND purpose_kind = ?
+         ORDER BY virtual_hours DESC, rowid DESC
+         LIMIT ?`,
+      )
+      .all(owner, purposeKind, limit);
+    const map = new Map<string, string[]>();
+    for (const e of eps) map.set(e.episode_id, []);
+    if (map.size === 0) return [];
+    const episodeIds = [...map.keys()];
+    const placeholders = episodeIds.map(() => "?").join(",");
+    const rows = this.db
+      .prepare(
+        `SELECT es.episode_id, es.subject_id FROM episode_subjects es
+         WHERE es.episode_id IN (${placeholders})
+           AND es.subject_type = 'knowledge'
+           AND EXISTS (SELECT 1 FROM episodes e
+             WHERE e.episode_id = es.episode_id AND e.owner_agent = ?)`,
+      )
+      .all(...episodeIds, owner) as Array<{ episode_id: string; subject_id: string }>;
+    for (const r of rows) map.get(r.episode_id)?.push(r.subject_id);
+    // 保持时间倒序（episodes 子查询顺序），返回 knowledge 主体按 id 升序去重。
+    return eps
+      .map((e) => ({ episodeId: e.episode_id, knowledgeIds: [...(map.get(e.episode_id) ?? [])].sort() }))
+      .filter((g) => g.knowledgeIds.length > 0);
+  }
+
+  /**
+   * 某用途最近 N 条 active/consolidated 情节，可选按 curriculum 主体过滤（§17.6：
+   * 场景开场注入教学进度用，status IN active/consolidated、curriculum 过滤、LIMIT 3）。
+   * bm25 记 0（中性）；本题不走 FTS 全文、按虚拟时间倒序取最近的进度里程碑。
+   */
+  recentByPurpose(
+    owner: string,
+    purposeKind: string,
+    opts: { curriculumId?: string; limit?: number } = {},
+  ): EpisodeCandidate[] {
+    const limit = opts.limit ?? PURPOSE_RETRIEVAL_LIMIT;
+    const where = [
+      "e.owner_agent = ?",
+      "e.purpose_kind = ?",
+      "(e.status = 'active' OR e.status = 'consolidated')",
+    ];
+    const args: unknown[] = [owner, purposeKind];
+    if (opts.curriculumId !== undefined && opts.curriculumId !== "") {
+      where.push(
+        `EXISTS (SELECT 1 FROM episode_subjects cs
+          WHERE cs.episode_id = e.episode_id AND cs.subject_type = 'curriculum' AND cs.subject_id = ?)`,
+      );
+      args.push(opts.curriculumId);
+    }
+    const stmt = this.db.prepare(
+      `SELECT e.episode_id, e.owner_agent, e.kind, e.scene_id, e.purpose_kind,
+              e.gist, e.detail, e.quote, e.emotion, e.valence, e.arousal,
+              e.salience, e.confidence, e.virtual_ts, e.virtual_hours, e.rehearsal_count,
+              e.retention, e.status
+         FROM episodes e
+        WHERE ${where.join(" AND ")}
+        ORDER BY e.virtual_hours DESC, e.rowid DESC
+        LIMIT ?`,
+    );
+    args.push(limit);
+    const rows = stmt.all(...args) as unknown as Array<Record<string, unknown>>;
+    return rows.map((r) => rowToCandidate(r, 0));
   }
 
   // ─── 衰减（§15.1）────────────────────────────────────────────────────────
@@ -533,7 +737,7 @@ export class MemoryDao {
         renderedCard: row.renderedCard,
         cardSha256: row.cardSha256,
         realTs: this.nowReal(),
-        modelConfigHash: row.modelConfigHash ?? null,
+        modelConfigHash: row.modelConfigHash ?? this.configHashFor(row.ownerAgent),
       });
   }
 }

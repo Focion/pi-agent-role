@@ -2,13 +2,15 @@
 // T1 组：上下文链尾（§21.3.1）—— I23 守卫 + create/open 等价
 //
 // 覆盖：
-//   I23 / T1.1  记忆卡片 context 钩子经 `unshift` 前置注册（在 mesh 链尾 context 钩子之前）
-//   T1.1        角色钩子扩展路径恒定 `pi-agent-role:role-hooks`
+//   T1.1        角色记忆钩子接 durable GenerationHooks.beforeRequest（mesh injectContext 同款）
+//   T1.1        角色钩子扩展名恒定 `pi-agent-role:role-hooks`（durable Extension.name）
 //   守卫 ①③     create 与 open 走同一 assembleTools → 工具面等价（回放核对要求）
 //
-// 说明：registerHookExtension 是 pi-backend 私有函数、且仅经 pi SDK 触达（真模型/真 SDK
-// 在必过集禁入）。I23 的「前置」事实是结构性的，故用源码扫描锁住（同 R4/R5 门禁哲学），
-// 并另以 makeSessionFactory 的功能路径验证 create/open 同源。
+// 说明：M01 把 pi-backend 从旧 coding-agent 后端迁到 pi-durable 1.5；记忆卡片 last-append 的
+// 承载机制从 `exts.unshift` 换成 `hook(GenerationTask, { beforeRequest })`。扩展名仍锁
+// `pi-agent-role:role-hooks`。⚠ I23 的「卡片在链尾（mesh injectContext 之后）」内容次序，
+// durable 端由多 beforeRequest 钩子的派发次序决定，属于 M02 待验证项（记录型 faux provider
+// 校验），源码扫描只锁「已接线为 generation 钩子」，不等价于次序已验。
 // ═══════════════════════════════════════════════════════════════════════════
 
 import { readFileSync } from "node:fs";
@@ -30,19 +32,19 @@ const ALL_BUILTINS = [
 ].map(A_TOOL);
 
 describe("T1 context chain tail (§21.3.1)", () => {
-  it("T1.1: role context-hook extension is prepended via `exts.unshift` (not `push`)", () => {
+  it("T1.1: role memory hook is wired as durable GenerationHooks.beforeRequest", () => {
     const f = fileURLToPath(new URL("../../src/mesh/pi-backend.ts", import.meta.url));
     const src = readFileSync(f, "utf8");
-    // I23：角色记忆卡片钩子必须在 mesh 的 context 钩子（数组更靠后）之前 → 用 unshift 前置。
-    expect(/\bexts\.unshift\s*\(/.test(src)).toBe(true);
-    // 不得用 push 追加（那会把角色钩子放到链尾之后，破坏 I23 顺序）。
-    expect(/\bexts\.push\s*\(/.test(src)).toBe(false);
+    // M02：记忆卡片 last-append 由 beforeRequest 钩子承载（mesh injectContext 同款）。
+    expect(/hook\(sdk\.durable\.GenerationTask/.test(src)).toBe(true);
+    expect(/beforeRequest/.test(src)).toBe(true);
+    // ⚠ I23 的「卡片在链尾（mesh 注入之后）」顺序是 M02 待验证项，不是本断言能锁的。
   });
 
-  it("T1.1: role hooks extension path is stable `pi-agent-role:role-hooks`", () => {
+  it("T1.1: role hooks extension name is stable `pi-agent-role:role-hooks`", () => {
     const f = fileURLToPath(new URL("../../src/mesh/pi-backend.ts", import.meta.url));
     const src = readFileSync(f, "utf8");
-    expect(src).toContain('path: "pi-agent-role:role-hooks"');
+    expect(src).toContain('name: "pi-agent-role:role-hooks"');
   });
 
   it("T1.1: create and open assemble the identical tool surface (guard ①③)", async () => {
@@ -52,7 +54,7 @@ describe("T1 context chain tail (§21.3.1)", () => {
       backend: {
         async create(ctx) {
           captured.create = toolSurfaceKey(ctx.tools);
-          return { session: {}, piSessionId: "p1" };
+          return { session: {}, runtimeRef: "p1" };
         },
         async open(ctx) {
           captured.open = toolSurfaceKey(ctx.tools);

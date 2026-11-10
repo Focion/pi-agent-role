@@ -36,7 +36,8 @@ UNION ALL SELECT 'retrieval_log', COUNT(*) FROM retrieval_log WHERE owner_agent 
 UNION ALL SELECT 'state_writes', COUNT(*) FROM state_writes WHERE owner_agent NOT IN (SELECT agent_id FROM agents)
 UNION ALL SELECT 'knowledge_events', COUNT(*) FROM knowledge_events WHERE owner_agent NOT IN (SELECT agent_id FROM agents)
 UNION ALL SELECT 'memory_decisions', COUNT(*) FROM memory_decisions WHERE owner_agent NOT IN (SELECT agent_id FROM agents)
-UNION ALL SELECT 'boundary_events', COUNT(*) FROM boundary_events WHERE owner_agent NOT IN (SELECT agent_id FROM agents)`,
+UNION ALL SELECT 'boundary_events', COUNT(*) FROM boundary_events WHERE owner_agent NOT IN (SELECT agent_id FROM agents)
+UNION ALL SELECT 'facility_records', COUNT(*) FROM facility_records WHERE owner_agent NOT IN (SELECT agent_id FROM agents)`,
   },
   {
     id: "A2",

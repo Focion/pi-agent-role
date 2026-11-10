@@ -24,6 +24,7 @@ import { openRoleDb } from "../../src/db/db.js";
 import { costMetricsExcludingReflect } from "../../src/inspect/cost.js";
 import { buildCostView, deriveMeshCounters } from "../../src/observe/cost-view.js";
 import type { MeshCounterSnapshot } from "../../src/mesh/counters-lookup.js";
+import { addMeshAnchor, installRolePairing } from "../helpers/pairing.js";
 
 const srcDir = fileURLToPath(new URL("../../src", import.meta.url));
 
@@ -136,6 +137,7 @@ describe("T6 observability / cost (§21.3.6)", () => {
          VALUES (?, 'role', 'x', ?, 'active', ?, ?, ?)`,
       )
       .run("ag", "0".repeat(64), "2026-01-01T00:00:00.000Z", "acct-main", "audit-7");
+    installRolePairing(roleDb.db); // R33：配对标识 + agents.mesh_instance_tag
 
     const meshDbPath = join(dir, "mesh.db");
     const mesh = new Database(meshDbPath);
@@ -153,6 +155,7 @@ describe("T6 observability / cost (§21.3.6)", () => {
     );
     insDel.run("d1", "m-main", "acct-main", "steer", 0, "P1");
     insDel.run("d2", "m-main", "audit-7", "steer", 1, "P1"); // reflect 账号收到
+    addMeshAnchor(mesh); // R33：锚点账号，配对成立
     mesh.close();
 
     const m = costMetricsExcludingReflect(roleDb.db, meshDbPath, {

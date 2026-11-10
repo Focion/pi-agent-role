@@ -15,6 +15,7 @@ export type IdKind =
   | "sw" // state_writes
   | "rl" // retrieval_log
   | "be" // boundary_events
+  | "fr" // facility_records
   | "sp" // subject_profiles（不独立主键，此处留用）
   | "ag"; // agents（无 prefix 需求时兜底）
 

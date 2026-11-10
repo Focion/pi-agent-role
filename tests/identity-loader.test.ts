@@ -146,6 +146,12 @@ describe("compileIdentity (§5.1)", () => {
       expect(spec.initialState.knowledgeSeed).toEqual([
         { topic: "物理", claim: "初三物理还没学完，量子力学我不懂。" },
       ])
+
+      // ⑧ 记忆策略：narrative_voice.sensory.dominant_channel 归一为英文通道 key（R22）
+      expect(spec.memoryPolicy.dominantChannel).toBe("auditory")
+
+      // ⑨ R25 联合验 L3：基础系统提示模板 ≤1200 token（粗估 bytes/4，§14.1.2）
+      expect(Math.ceil(Buffer.byteLength(spec.systemPrompt, "utf8") / 4)).toBeLessThanOrEqual(1200)
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }

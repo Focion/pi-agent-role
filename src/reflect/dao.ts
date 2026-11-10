@@ -15,6 +15,7 @@ import type { SubjectRef } from "../memory/subject.js";
 import { newId } from "../runtime/id.js";
 import type { ProfileRow, ReflectionTrigger } from "./types.js";
 import { triggerColumn } from "./types.js";
+import { modelConfigHashFromJson } from "../compile/fingerprint.js";
 
 /** 供组装 ReflectionInput 的情节简报（§13.4.1）。 */
 export interface EpisodeBrief {
@@ -52,6 +53,8 @@ export interface ReflectionRow {
   inputJson: string;
   status: "running" | "done" | "failed";
   startedAt: string;
+  /** R06 E09：缺省按写时刻该 agent 的定稿模型配置哈希；显式传入可覆盖（测试）。 */
+  modelConfigHash?: string | null;
 }
 
 export interface ReflectionDaoDeps {
@@ -68,6 +71,16 @@ export class ReflectionDao {
     this.nowReal = deps.nowReal;
   }
 
+  /** 写时刻该 agent 的定稿模型配置哈希（R06 E09）；无 model_config_json 返回 null。 */
+  private configHashFor(owner: string): string | null {
+    const row = this.db
+      .prepare<[string], { model_config_json: string | null }>(
+        `SELECT model_config_json FROM agents WHERE agent_id = ?`,
+      )
+      .get(owner);
+    return modelConfigHashFromJson(row?.model_config_json ?? null);
+  }
+
   /** episode 是否属于该 owner（优于「存在性」，反射证据只认 owner 分区，§13.4.3）。 */
   ownsEpisode(owner: string, episodeId: string): boolean {
     return (
@@ -81,14 +94,50 @@ export class ReflectionDao {
 
   // ─── 读取端（组装输入）────────────────────────────────────────────────────
 
-  /** 最近一次自省的 started_at（real ts）；从未 reflect 返回 null。 */
+  /**
+   * 最近一次**成功完成**自省的 finished_at（real ts）；从未成功 reflect 返回 null。
+   * A21：成功游标独立于最新尝试——失败的 / 仍在 running 的反射不推进 since，
+   * 否则其 started_at 会把尚未成功处理的旧 episodes 排出下一批证据窗。
+   * 用 finished_at（而非 started_at）：自省自己写的巩固/自我洞察情节 real_ts 落在
+   * [started_at, finished_at] 内，以 finished_at 为游标不会把它们卷进下一轮重复处理。
+   */
   lastReflectionAt(owner: string): string | null {
     const row = this.db
-      .prepare<[string], { started_at: string }>(
-        `SELECT started_at FROM reflections WHERE owner_agent = ? ORDER BY started_at DESC LIMIT 1`,
+      .prepare<[string], { finished_at: string | null }>(
+        `SELECT finished_at FROM reflections
+          WHERE owner_agent = ? AND status = 'done' AND finished_at IS NOT NULL
+          ORDER BY finished_at DESC LIMIT 1`,
       )
       .get(owner);
-    return row?.started_at ?? null;
+    return row?.finished_at ?? null;
+  }
+
+  /**
+   * 最近一次自省留下的未澄清问题（§13.4.1 旧问题连续，R17；存在 reflections.output_json）。
+   * 只认 status='done' 的反射，按 started_at 从新到旧扫描，取第一条含合法 openQuestions 数组
+   * 的记录；失败的反射或未带 openQuestions 的更早反射不误当最新。缺数据一律回空数组。
+   */
+  lastOpenQuestions(owner: string): string[] {
+    const rows = this.db
+      .prepare<[string], { output_json: string | null }>(
+        `SELECT output_json FROM reflections
+          WHERE owner_agent = ? AND status = 'done' AND output_json IS NOT NULL
+          ORDER BY started_at DESC`,
+      )
+      .all(owner);
+    for (const row of rows) {
+      if (!row.output_json) continue;
+      try {
+        const parsed = JSON.parse(row.output_json) as { openQuestions?: unknown };
+        if (!Array.isArray(parsed.openQuestions)) continue;
+        return (parsed.openQuestions as unknown[])
+          .filter((x): x is string => typeof x === "string" && x.trim().length > 0)
+          .map((x) => x.trim().slice(0, 200));
+      } catch {
+        continue;
+      }
+    }
+    return [];
   }
 
   /** 自上次 reflect 以来（real_ts > since）的 active 情节：计数 + 简报 + 最高 arousal。 */
@@ -215,7 +264,7 @@ export class ReflectionDao {
            episodes_written, profiles_touched, status, started_at, finished_at, model_config_hash)
         VALUES (@id, @owner, @trigger, @sceneId, @reflectMsgId,
                 NULL, NULL, @inputJson, NULL,
-                0, 0, @status, @startedAt, NULL, NULL)
+                0, 0, @status, @startedAt, NULL, @modelConfigHash)
       `)
       .run({
         id: row.reflectionId,
@@ -226,6 +275,7 @@ export class ReflectionDao {
         inputJson: row.inputJson,
         status: row.status,
         startedAt: row.startedAt,
+        modelConfigHash: row.modelConfigHash ?? this.configHashFor(row.ownerAgent),
       });
   }
 
@@ -247,6 +297,29 @@ export class ReflectionDao {
     this.db
       .prepare(`UPDATE reflections SET status = 'failed', output_json = ?, finished_at = ? WHERE reflection_id = ?`)
       .run(JSON.stringify({ error: message }), this.nowReal(), reflectionId);
+  }
+
+  /**
+   * R19 重启恢复：把上次进程遗留的 `running` 批整体标记 failed（interrupted）并落 finished_at，
+   * 使其「正确终结」而非永久悬挂。A21 成功游标只认 done 行，这些未完成输入的 evidence 窗
+   * 不会被跳过，下次 `maybe()` 会按同一证据窗重新成批。返回终结的批数。
+   */
+  failOrphanedRunning(): number {
+    const res = this.db
+      .prepare(
+        `UPDATE reflections
+            SET status = 'failed', output_json = ?, finished_at = ?
+          WHERE status = 'running'`,
+      )
+      .run(JSON.stringify({ error: "interrupted" }), this.nowReal());
+    return res.changes;
+  }
+
+  /** 发送成功后回填 reflect_msg_id（A12：发送前先落行，msgId 后补，不因此延后批次关联）。 */
+  recordReflectMsg(reflectionId: string, reflectMsgId: string): void {
+    this.db
+      .prepare(`UPDATE reflections SET reflect_msg_id = ? WHERE reflection_id = ?`)
+      .run(reflectMsgId, reflectionId);
   }
 
   reflectionStatus(reflectionId: string): { owner: string; status: string } | undefined {

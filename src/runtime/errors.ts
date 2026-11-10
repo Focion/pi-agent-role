@@ -65,6 +65,18 @@ export class BlueprintNotFound extends RoleRuntimeError {
   }
 }
 
+/**
+ * 双库配对不成立（§18.2 / R33）：缺锚点、锚点标记不符、或 mesh 库被替换。此时所有
+ * 跨库读取（恢复、成本重算、悬挂扫描）应整体拒绝出数，而不是给一个漏排除/误判的数。
+ */
+export class PairingError extends RoleRuntimeError {
+  readonly detail: string;
+  constructor(detail: string) {
+    super(`dual-db pairing not established: ${detail}`);
+    this.detail = detail;
+  }
+}
+
 /** DAO 检出跨 owner 写入尝试（§19.4 分区隔离）。刷 `state_writes(reason='cross_owner_write_rejected')`。 */
 export class CrossOwnerWriteRejected extends RoleRuntimeError {
   readonly ownerAgent: string;

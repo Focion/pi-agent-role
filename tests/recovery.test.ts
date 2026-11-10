@@ -13,7 +13,7 @@ import { join } from "node:path";
 import Database from "better-sqlite3";
 import { describe, expect, it } from "vitest";
 
-import { createRuntime } from "../src/index.js";
+import { createRuntimeInternals } from "../src/runtime/runtime.js";
 import { stringifyYaml } from "../src/compile/yaml.js";
 import type { RuntimeInternals } from "../src/runtime/runtime.js";
 
@@ -46,7 +46,7 @@ describe("P1 recovery (§4.2.4): cross-process kill → resume", () => {
     const meshDbPath = join(root, "mesh.db");
 
     // ── 进程一：创建 Agent，落库并注册 mesh ──
-    const rt1 = (await createRuntime({
+    const rt1 = (await createRuntimeInternals({
       root,
       db: dbPath,
       meshDb: meshDbPath,
@@ -71,7 +71,7 @@ describe("P1 recovery (§4.2.4): cross-process kill → resume", () => {
     expect(persisted.mesh_endpoint_id).toBe(created.mesh.endpointId);
 
     // ── 进程二：重新打开同一份 root/DB-A/DB-B，恢复期回填 ──
-    const rt2 = (await createRuntime({
+    const rt2 = (await createRuntimeInternals({
       root,
       db: dbPath,
       meshDb: meshDbPath,

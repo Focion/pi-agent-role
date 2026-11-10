@@ -12,9 +12,47 @@ import { createHash } from "node:crypto";
 import { readFile, readdir } from "node:fs/promises";
 import { join, relative } from "node:path";
 
+import type { ModelConfig } from "./types.js";
+
 /** 单个字符串/缓冲的 sha256，十六进制小写。 */
 export function sha256Hex(input: string | Buffer): string {
   return createHash("sha256").update(input).digest("hex");
+}
+
+/** 键序稳定的规范序列化：递归按键名排序、跳过 undefined 叶子。保证同配置无论构造顺序都同哈希。 */
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) {
+    return `[${value.map((v) => canonicalJson(v)).join(",")}]`;
+  }
+  if (value !== null && typeof value === "object") {
+    const entries = Object.entries(value as Record<string, unknown>)
+      .filter(([, v]) => v !== undefined)
+      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+    return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${canonicalJson(v)}`).join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+/**
+ * 模型配置哈希（R06 E09：情节/自省/检索写“实际配置 hash”）。ModelConfig 只含
+ * provider/modelId/thinkingLevel/temperature/budget，不含任何凭据，故哈希与快照天然无凭据。
+ * 键序稳定的 sha256，用作同一条配置的可审计指纹。
+ */
+export function modelConfigHash(config: ModelConfig): string {
+  return sha256Hex(canonicalJson(config));
+}
+
+/**
+ * 从 agents.model_config_json 原文算哈希。空/坏 JSON 返回 null —— 不可得标 unknown，
+ * 绝不伪造旧来源（R06「旧来源不伪造」）。
+ */
+export function modelConfigHashFromJson(json: string | null | undefined): string | null {
+  if (!json) return null;
+  try {
+    return modelConfigHash(JSON.parse(json) as ModelConfig);
+  } catch {
+    return null;
+  }
 }
 
 /** 顺序敏感聚合指纹：把若干部分按序喂进同一个 hash。用于 promptVersion / spec_hash。 */

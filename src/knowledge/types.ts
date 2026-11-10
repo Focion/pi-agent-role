@@ -48,6 +48,20 @@ const MASTERY_ORDER: Record<Mastery, number> = {
   forgotten: -1,
 };
 
+/** 阶梯序 → 状态名（A14 fading 恢复的晋级上限回查；只含进梯的四态）。 */
+const MASTERY_BY_ORDER: Record<number, Mastery> = { 1: "heard", 2: "understood", 3: "applied", 4: "mastered" };
+
+/**
+ * A14：fading 恢复的晋级上限 = 衰减前状态（decay_from）。
+ * 提案越过上限时夹回上限；提案更保守（如只回到 heard）则原样放行。
+ * decay_from 为 null（仅理论上的脏数据）时视为无上限，保持旧行为。
+ */
+function capFadingRecovery(to: Mastery, decayFrom: Mastery | null): Mastery {
+  const capOrder = decayFrom === null ? -1 : MASTERY_ORDER[decayFrom];
+  const toOrder = MASTERY_ORDER[to];
+  return capOrder > 0 && toOrder > capOrder ? (MASTERY_BY_ORDER[capOrder] ?? to) : to;
+}
+
 /** 每个目标状态的最低证据集合（§17.2 表）。fading/forgotten 只由衰减任务写，不在此列。 */
 const TARGET_EVIDENCE: Record<Exclude<Mastery, "fading" | "forgotten">, readonly EvidenceKind[]> = {
   heard: ["mentioned"],
@@ -119,6 +133,17 @@ export type KnowledgeVerdict =
       eventIds: string[];
       /** true = 同态复述（T6），只维护计数不迁移。 */
       practiced: boolean;
+      /**
+       * 误区被纠正（§17.4.2 高价值事件）：本轮把既有 is_misconception 从 1 清成 0。
+       * 出现时调用方应写一条系统抬高 salience 的情报（双主体 person:纠正者 + knowledge:topic）。
+       */
+      misconceptionCorrected?: {
+        topic: string;
+        /** 纠正者序列化 SubjectRef（"self" / "person:xx" / "facility:xx"，§17.3 resolveTaughtBy）。 */
+        corrector: string;
+        /** 旧的错误理解原文（纠正后保留，作为历史）。 */
+        wrongBelief: string | null;
+      };
     }
   | { ok: false; reason: KnowledgeRejectReason };
 
@@ -159,7 +184,7 @@ export type TransitionPlan =
  *   · T2 heard→understood、T3 understood→applied、T4 applied→mastered —— 一条事件；
  *   · T5 heard→applied —— 跳级，两条事件（heard→understood→applied）；
  *   · T6 同态 / 「重教降级」—— 无事件（only practice_count/last_practiced 维护）；
- *   · T9 fading→higher —— 一条事件（任何 use 证据）；
+ *   · T9 fading→higher —— 一条事件（任何 use 证据）；晋级封顶 = 衰减前状态（A14）。
  *   · T11 applied|mastered→understood（corrected/failed）—— 一条事件 + 置误区。
  * 纯函数，无 IO；T4 的「跨 2 虚拟日 / 2 次 solved」在 service 查库，不在此处。
  */
@@ -167,6 +192,7 @@ export function classifyUpdate(
   current: Mastery | null,
   to: Mastery,
   kind: EvidenceKind,
+  decayFrom: Mastery | null = null,
 ): TransitionPlan {
   // fading / forgotten / unseen 只由衰减任务或「无行」表达，Agent 不得提议写入（§17.1.2 T7/T8）。
   if (to === "fading" || to === "forgotten") {
@@ -176,7 +202,8 @@ export function classifyUpdate(
   // T9：fading 恢复（再次被使用，任何 use 证据 → 回到更高状态）。
   if (current === "fading") {
     if (kind === "mentioned" || kind === "explained" || kind === "self_explained" || kind === "solved") {
-      return { ok: true, from: "fading", to, events: "one", markMisconception: false };
+      // A14：恢复只到衰减前状态，不能借一句 mentioned 跳 mastered（跳级须重走 solved）。
+      return { ok: true, from: "fading", to: capFadingRecovery(to, decayFrom), events: "one", markMisconception: false };
     }
     return { ok: false, reason: "EVIDENCE_MISSING" };
   }

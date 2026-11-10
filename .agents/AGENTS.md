@@ -4,14 +4,13 @@
 
 ## 项目上下文
 
-> 当前仓库为空（`main` 分支尚无提交），下列待定项在第一版代码落地后补齐。
-
-- 项目名：`pi-agent-role`
+- 项目名：`pi-agent-role`，包名 `@pi/agent-role`。
 - 远端仓库：https://github.com/Focion/pi-agent-role
-- 项目简介：待定（与同级仓库 `pi-agent-mesh` 同属 `aivirtual` 工作区，定位与边界需在 `notes/product/` 或 `notes/tech/` 首篇文档中确定）
-- 技术栈：待定
-- 入口与关键模块：待定
-- 本地运行 / 测试命令：待定
+- 项目简介：供宿主嵌入的通用角色 Agent 运行时。通讯、投递和会话恢复交给同级 `pi-agent-mesh`；本库管理身份、记忆、知识、自省、设施和场景，不提供 CLI 或 HTTP 服务。
+- 技术栈：TypeScript、SQLite（`better-sqlite3`）、npm、Vitest、tsup；包发布 ESM、CJS 和类型声明。
+- 入口与关键模块：`src/index.ts` 的 `createRuntime(options)`。源码导航及开发约束见 [根 AGENTS.md](../AGENTS.md)。
+- 本地检查命令：`npm run check:imports`、`npm run typecheck`、`npm test`、`npm run build`。先核验 Node.js、原生依赖及同级 mesh 产物；fake 测试不证明 SDK 适配可用。
+- 当前计划：[统一审计、mesh 适配与核心闭环](notes/plan/2026-11-02-consolidated-audit-and-mesh-alignment-plan.md)，状态为 active，H01–H04 已获用户确认。四份旧 plan 由此接管；方案确认和归档都不表示未完成项已关闭。
 
 ## 目录地图
 

@@ -10,12 +10,14 @@
 // 此处不重复。分层纪律：本文件不 import @pi/agent-mesh（R1）。
 // ═══════════════════════════════════════════════════════════════════════════
 
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, linkSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
+import Database from "better-sqlite3";
 
-import { openRoleDb } from "../../src/db/db.js";
+import { assertDistinctDbPaths, openRoleDb } from "../../src/db/db.js";
+import { createRuntime } from "../../src/index.js";
 import { virtualHoursOf } from "../../src/runtime/virtual-clock.js";
 
 function setup() {
@@ -126,6 +128,97 @@ describe("T4 storage / cross-db contract (§21.3.4)", () => {
       expect(objs).toHaveLength(0);
     } finally {
       cleanup();
+    }
+  });
+});
+
+describe("R03 same-file / alias rejection (§18.7 / H02)", () => {
+  it("rejects identical resolved path (.. normalization)", () => {
+    const dir = mkdtempSync(join(tmpdir(), "pi-role-r03-"));
+    try {
+      const a = join(dir, "role-agent.db");
+      const b = `${dir}/sub/../role-agent.db`;
+      expect(() => assertDistinctDbPaths(a, b)).toThrow(/same path/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects symlink alias when both files exist", () => {
+    const dir = mkdtempSync(join(tmpdir(), "pi-role-r03-"));
+    try {
+      const a = join(dir, "role.db");
+      const b = join(dir, "mesh.db");
+      writeFileSync(a, "");
+      symlinkSync(a, b); // mesh.db 是指向 role.db 的符号链接
+      expect(() => assertDistinctDbPaths(a, b)).toThrow(/same file|same path/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects hardlink alias when both files exist", () => {
+    const dir = mkdtempSync(join(tmpdir(), "pi-role-r03-"));
+    try {
+      const a = join(dir, "role.db");
+      const b = join(dir, "mesh.db");
+      writeFileSync(a, "");
+      linkSync(a, b); // 硬链接：同 dev+ino
+      expect(() => assertDistinctDbPaths(a, b)).toThrow(/same file|same path/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("allows distinct paths and :memory:", () => {
+    expect(() => assertDistinctDbPaths("/x/a.db", "/x/b.db")).not.toThrow();
+    expect(() => assertDistinctDbPaths(":memory:", "/x/b.db")).not.toThrow();
+    expect(() => assertDistinctDbPaths("/x/a.db", ":memory:")).not.toThrow();
+  });
+
+  it("createRuntime rejects same path before any side effect (no file created)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pi-role-r03-"));
+    const db = join(dir, "shared.db");
+    try {
+      await expect(
+        createRuntime({ root: dir, db, meshDb: db, fake: { sessions: true } }),
+      ).rejects.toThrow(/same path/);
+      // 守卫先于 openRoleDb 的 mkdir/建库，副作用前拒绝。
+      expect(existsSync(db)).toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("R03: migration failure rolls back atomically — init is retryable", () => {
+    const dir = mkdtempSync(join(tmpdir(), "pi-role-r03-"));
+    const path = join(dir, "role-agent.db");
+    try {
+      // 造一个与 001 冲突的半成品：预建缺失 owner_agent 的 episodes（IF NOT EXISTS 会跳过
+      // 001 的 CREATE TABLE episodes），使 001 后续 `idx_episodes_owner_ts ON episodes(owner_agent)`
+      // 建索引失败 → 整段迁移回滚。这依赖 001 的该索引列，属源码级回归锁定。
+      const raw = new Database(path);
+      raw.pragma("user_version = 0");
+      raw.exec("CREATE TABLE episodes (dummy INTEGER)");
+      raw.close();
+
+      expect(() => openRoleDb(path)).toThrow();
+
+      // 整段迁移单事务：失败文件中早于索引的 CREATE TABLE agents 也被回滚，user_version 保持 0。
+      const check = new Database(path, { readonly: true });
+      try {
+        expect(check.pragma("user_version", { simple: true })).toBe(0);
+        const tables = check
+          .prepare("SELECT name FROM sqlite_master WHERE type='table'")
+          .all() as Array<{ name: string }>;
+        const names = tables.map((r) => r.name);
+        expect(names).toContain("episodes"); // 只有手工建的半成品，无 agents/scenes 等
+        expect(names).not.toContain("agents");
+      } finally {
+        check.close();
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
     }
   });
 });

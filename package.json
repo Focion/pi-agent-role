@@ -8,7 +8,7 @@
   "types": "./dist/index.d.ts",
   "license": "MIT",
   "engines": {
-    "node": ">=20"
+    "node": ">=24.0.0"
   },
   "exports": {
     ".": {
@@ -34,20 +34,30 @@
     "confbox": "^0.1.8"
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": ">=0.84.4",
-    "@earendil-works/pi-ai": ">=0.84.4"
+    "@earendil-works/pi-ai": "^1.5.0",
+    "@earendil-works/pi-durable": "^1.5.0",
+    "@earendil-works/pi-schema": "^1.5.0",
+    "@earendil-works/chord": "^1.5.0"
   },
   "peerDependenciesMeta": {
-    "@earendil-works/pi-coding-agent": {
+    "@earendil-works/pi-ai": {
       "optional": true
     },
-    "@earendil-works/pi-ai": {
+    "@earendil-works/pi-durable": {
+      "optional": true
+    },
+    "@earendil-works/pi-schema": {
+      "optional": true
+    },
+    "@earendil-works/chord": {
       "optional": true
     }
   },
   "devDependencies": {
-    "@earendil-works/pi-ai": "^0.85.1",
-    "@earendil-works/pi-coding-agent": "0.85.1",
+    "@earendil-works/pi-ai": "1.5.0",
+    "@earendil-works/pi-durable": "1.5.0",
+    "@earendil-works/pi-schema": "1.5.0",
+    "@earendil-works/chord": "1.5.0",
     "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^24.0.0",
     "tsup": "^8.4.0",

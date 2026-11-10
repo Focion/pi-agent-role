@@ -36,6 +36,10 @@ export interface RoleMeshOptions {
   backend?: SessionBackend;
   /** 逐账号领域工具处理器（P3 记忆：remember/recall 需按 owner 分区闭包；异步装配）。 */
   domainHandlersFor?: RoleSessionFactoryOptions["domainHandlersFor"];
+  /** 发送装饰（C10 / §3.6）：按 accountId 返回当前场景要补齐的 ext.role 字段。 */
+  extProvider?: RoleSessionFactoryOptions["extProvider"];
+  /** 边界审计（R11 / §18.4.4）：mesh_send 被 mesh 拒绝时回调，runtime 写成 boundary_events。 */
+  boundaryAudit?: RoleSessionFactoryOptions["boundaryAudit"];
   /**
    * 预建注册表（P3 记忆服务在 createRoleMesh 之前就要拿着注册表闭包反查 owner 分区）；
    * 传入时 createRoleMesh 不再自建，只往里 seed + 回填。缺省自建。
@@ -117,6 +121,8 @@ export async function createRoleMesh(opts: RoleMeshOptions): Promise<RoleMesh> {
       backend: opts.backend,
       classify: (accountId) => registry.kindOf(accountId),
       domainHandlersFor: opts.domainHandlersFor,
+      extProvider: opts.extProvider,
+      boundaryAudit: opts.boundaryAudit,
     }),
     activation: makeActivationPolicy(),
     floor: makeFloorPolicy(opts.floorState ?? makeFloorStateController()),

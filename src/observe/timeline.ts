@@ -135,7 +135,9 @@ export function buildMemoryTimeline(
   // ── 组装 items ──
   function evidenceLevel(item: typeof items[number]): EvidenceLevel {
     if (item.source_msg_id && evidenceMap.has(item.source_msg_id)) return "L0";
-    if (item.quote) return "L1";
+    // A30：L1 = 有消息锚点但原文已裁剪 + 有 quote。证据等级依「来源」而非「是否填了 quote」——
+    // 无锚点（source_msg_id 为空）的 quote 只是主观摘录，不能冒充引文证据。
+    if (item.source_msg_id && item.quote) return "L1";
     return "L2";
   }
 

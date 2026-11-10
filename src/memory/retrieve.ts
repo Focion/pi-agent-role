@@ -39,15 +39,21 @@ function normalizeRelevance(bm25Values: number[]): number[] {
   return s.map((v) => v / max);
 }
 
+/** 主体的在场集合 key：self 恒 "self"，其余为 `${type}:${id}`（A27）。 */
+function subjectKey(s: SubjectRef): string {
+  return s.type === "self" ? "self" : `${s.type}:${s.id}`;
+}
+
 /**
  * subjectMatch：命中主体数 / 记忆主体数（分母是记忆的主体数，不是在场人数）。
  * 无主体情节给基线分 RETRIEVAL.noSubjectBaseline；self 主体恒命中（§8 段自主恒命中）。
+ * 在场集合用 (type,id) 全形 key，避免 person:B / facility:B 类型空间混淆（A27）。
  */
 function subjectMatchOf(subjects: SubjectRef[], present: ReadonlySet<string>): number {
   if (subjects.length === 0) return RETRIEVAL.noSubjectBaseline;
   let hit = 0;
   for (const s of subjects) {
-    if (s.type === "self" || present.has(s.id)) hit += 1;
+    if (s.type === "self" || present.has(subjectKey(s))) hit += 1;
   }
   return hit / subjects.length;
 }
@@ -128,41 +134,42 @@ export class TurnRetrievalLedger {
   }
 
   private take(tokens: number, ceiling: number): number {
-    const grant = Math.max(0, Math.min(tokens, ceiling - this.used));
-    this.used += grant;
-    return grant;
+    // A25：整卡获批才扣账；剩余额度装不下一张卡时返回 0，不产生「先占部分再丢弃」的消耗。
+    const available = ceiling - this.used;
+    if (available < tokens) return 0;
+    this.used += tokens;
+    return tokens;
   }
 }
 
 /**
  * 按分数选卡片直到 token 预算耗尽。返回入选卡片（已渲染）与预算账。
- * `isRecall` 决定走 auto（600 顶）还是 recall（900 全量）的遗留逻辑，由 ledger 方法体现。
+ * `isRecall` 决定走 auto（600 顶）还是 recall（900 全量）的额度路径，由 ledger 方法体现。
+ * `callCap` 是**单次 recall 返回总量**上限（§14.5.3 perCallTokenCap），跨卡累计判断，
+ * 不是单卡判断（A26）；auto 注入无单次上限，仅受共享 L1 池约束。
  */
 export function selectCards(
   ranked: RankedCandidate[],
   render: (c: RankedCandidate) => string,
   ledger: TurnRetrievalLedger,
   isRecall: boolean,
-  perCardCap = RECALL_QUOTA.perCallTokenCap,
+  callCap = RECALL_QUOTA.perCallTokenCap,
 ): { cards: string[]; selectedIds: string[]; tokens: number; clamped: number } {
   const cards: string[] = [];
   const selectedIds: string[] = [];
   let tokens = 0;
   let clamped = 0;
+  let callTokens = 0;
   for (const r of ranked) {
     const text = render(r);
     const t = estimateTokens(text);
-    // recall 单次返回 cap（600）：超出丢弃后续所有卡片。
-    if (isRecall && t > perCardCap) {
+    // 单次 recall 返回总量上限：跨卡累计，超出即裁掉剩余卡片（A26）。
+    if (isRecall && callTokens + t > callCap) {
       clamped += 1;
       continue;
     }
+    // 共享池整卡获取：不足则丢弃且不扣账（A25）。
     const grant = isRecall ? ledger.reserveRecall(t) : ledger.reserveAuto(t);
-    if (grant <= 0) {
-      clamped += 1;
-      continue;
-    }
-    // 若卡片 token 超过当次获批（grant < t），按获批截断不注入，丢弃该卡。
     if (grant < t) {
       clamped += 1;
       continue;
@@ -170,6 +177,7 @@ export function selectCards(
     cards.push(text);
     selectedIds.push(r.candidate.episodeId);
     tokens += t;
+    callTokens += t;
   }
   return { cards, selectedIds, tokens, clamped };
 }

@@ -9,7 +9,8 @@
 //
 // M4 防线不可丢：一切外来内容必须包在 <<<MSG>>>…<<<END MSG>>> 内。因此本槽
 // 复用 mesh 的 DefaultRenderer 保底外层，只覆盖「名字」这一处领域定制。
-// P0 尚未接 compile/identity.yaml（P1），故 nameOf 恒为 undefined ⇒ 退化为内建。
+// nameOf 由 bootstrap 接 registry.nameOf（agents.display_name，compiled identity）；
+// 无名字反查（nameOf 为 undefined）时逐字节退化为内建渲染器。
 // ═══════════════════════════════════════════════════════════════════════════
 
 import type { Envelope, Renderer } from "@pi/agent-mesh/core";

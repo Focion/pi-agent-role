@@ -102,13 +102,18 @@ export function renderMemoryCard(input: RenderCardInput): string {
   if (input.confidence < 0.6) distortion = "\n（我记得好像是……不太确定）";
   else if (!p.quote) distortion = "\n（具体怎么说的记不清了）";
 
+  // A28：projectEpisode 已按阈值保留了 detail（≥0.45）/quote（≥0.70），
+  // 渲染层必须实际展示它们，不能只给 gist；被裁掉的字段仍以「记不清」兜底。
+  const detailLine = p.detail ? `\n（细节：${p.detail}）` : "";
+  const quoteLine = p.quote ? `\n（原话：${p.quote}）` : "";
+
   // 强度保留两位，供模型与检索审计一致地读数
   const strength = input.retention.toFixed(2);
 
   return [
     "<<<MEMORY",
     `[${label} · ${when} · 强度${strength}${aboutText}]`,
-    `${p.gist}${distortion}${affectLine}`,
+    `${p.gist}${distortion}${detailLine}${quoteLine}${affectLine}`,
     "MEMORY>>>",
   ].join("\n");
 }

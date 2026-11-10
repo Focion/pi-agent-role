@@ -74,15 +74,37 @@ export function buildCostView(
   const until = opts.until ?? DEFAULT_UNTIL;
   const scopeSceneIds = opts.sceneIds?.length ? opts.sceneIds : "all";
   const scopeAgentIds = opts.agentIds?.length ? opts.agentIds : "all";
+  // R35：是否真的在按时间窗收窄（默认全域不算「窗口查询」）。
+  const timeWindowed = since !== DEFAULT_SINCE || until !== DEFAULT_UNTIL;
 
-  // ── roleOnly：复用现有成本排除算法（§20.2.4）──
-  const roleOnly = costMetricsExcludingReflect(roleDb, meshDbPath, { since, until });
+  // A36/R35：三段各自能支持的过滤范围不同，准确声明（不是把同一 scope 包装到不同数据段上）。
+  const caveats: string[] = [
+    timeWindowed
+      ? `role 侧 retrieval/reflection 与 mesh 投递统一按半开时间窗 [${since}, ${until}) 过滤`
+      : "未指定时间窗：mesh 投递 / role 侧检索与自省按默认全域 [1970-01-01, 9999-12-31) 取数",
+    "roleOnly（mesh 投递层）无 sceneId，只按 agentIds ∩ 时间窗；sceneIds 不作用于该段",
+    "retrieval / reflection 按 agentIds ∩ sceneIds ∩ 时间窗过滤",
+    "scene 累计量（turn_count / token_spent / token_budget / overBudget）为场景生命周期累计，只按 sceneIds，不按 created_at 进时间窗",
+    "roleNormalized.utteranceMessages/verbatim* 与 reflection.mesh* 需 mesh 事件流归因，当前不可得 → null（不以 0 占位）",
+    "meshCounters 段来自 Observer 计数器快照：按小时分桶、只按 since 作下界，且只在 mesh 保留期内有效",
+  ];
+
+  // A36/R35：三段各自带自己所能支持的 scope 交集。
+  // · roleOnly（mesh 投递层）无 sceneId，只能按 agentIds ∩ 时间窗。
+  // · 本环 retrieval_log / reflections 有 owner_agent + scene_id，可做完整交集。
+  // · scenes 层只有 scene_id，且 turn/token 是生命周期累计 → 只按 sceneIds，不进时间窗。
+  const roleOnly = costMetricsExcludingReflect(roleDb, meshDbPath, {
+    since,
+    until,
+    agentIds: opts.agentIds,
+  });
 
   const meshCounters = deriveMeshCounters(opts.meshCounters);
 
   // ── 本环侧检索开销（retrieval_log）──
   const retClause = scopeSceneIds === "all" ? "" : `AND scene_id IN (${scopeSceneIds.map(() => "?").join(",")})`;
-  const retBind = scopeSceneIds === "all" ? [] : scopeSceneIds;
+  const retAgentClause = scopeAgentIds === "all" ? "" : `AND owner_agent IN (${scopeAgentIds.map(() => "?").join(",")})`;
+  const retBind = [...(scopeSceneIds === "all" ? [] : scopeSceneIds), ...(scopeAgentIds === "all" ? [] : scopeAgentIds)];
   const retRow = roleDb
     .prepare<unknown[], { calls: number; tL2: number; tL1: number; tTransient: number; tTotal: number; clamped: number }>(
       `SELECT COUNT(*)              AS calls,
@@ -92,7 +114,7 @@ export function buildCostView(
               COALESCE(SUM(tokens_total), 0)    AS tTotal,
               COALESCE(SUM(clamped), 0)         AS clamped
          FROM retrieval_log
-        WHERE real_ts >= ? AND real_ts <= ? ${retClause}`,
+        WHERE real_ts >= ? AND real_ts < ? ${retClause} ${retAgentClause}`,
     )
     .get(since, until, ...retBind) ?? { calls: 0, tL2: 0, tL1: 0, tTransient: 0, tTotal: 0, clamped: 0 };
 
@@ -103,7 +125,7 @@ export function buildCostView(
     const totals = roleDb
       .prepare<unknown[], { tokens_total: number }>(
         `SELECT tokens_total FROM retrieval_log
-          WHERE real_ts >= ? AND real_ts <= ? ${retClause} AND tokens_total > 0
+          WHERE real_ts >= ? AND real_ts < ? ${retClause} ${retAgentClause} AND tokens_total > 0
           ORDER BY tokens_total`,
       )
       .all(since, until, ...retBind)
@@ -118,8 +140,9 @@ export function buildCostView(
   }
 
   // ── 本环侧自省开销（reflections）──
-  const reflClause = scopeAgentIds === "all" ? "" : `AND owner_agent IN (${scopeAgentIds.map(() => "?").join(",")})`;
-  const reflBind = scopeAgentIds === "all" ? [] : scopeAgentIds;
+  const reflAgentClause = scopeAgentIds === "all" ? "" : `AND owner_agent IN (${scopeAgentIds.map(() => "?").join(",")})`;
+  const reflSceneClause = scopeSceneIds === "all" ? "" : `AND scene_id IN (${scopeSceneIds.map(() => "?").join(",")})`;
+  const reflBind = [...(scopeAgentIds === "all" ? [] : scopeAgentIds), ...(scopeSceneIds === "all" ? [] : scopeSceneIds)];
   const reflRow = roleDb
     .prepare<unknown[], {
       runs: number;
@@ -138,24 +161,25 @@ export function buildCostView(
                 ELSE 0 END
               ), 0)                                                AS wallMsTotal
          FROM reflections
-        WHERE started_at >= ? AND started_at <= ? ${reflClause}`,
+        WHERE started_at >= ? AND started_at < ? ${reflAgentClause} ${reflSceneClause}`,
     )
     .get(since, until, ...reflBind) ?? { runs: 0, failed: 0, episodesWritten: 0, profilesTouched: 0, wallMsTotal: 0 };
 
-  // ── 本环归一读数（§20.2.3）──
+  // ── 本环归一读数（§20.2.3）。R35：scene 的 turn_count 是生命周期累计，只按 sceneIds
+  //    选场景，不按 created_at 进时间窗——否则会把「累计值」按创建时间筛成「窗口值」。──
   const scnClause = scopeSceneIds === "all" ? "" : `AND scene_id IN (${scopeSceneIds.map(() => "?").join(",")})`;
   const scnBind = scopeSceneIds === "all" ? [] : scopeSceneIds;
   const scnRow = roleDb
     .prepare<unknown[], { turns: number }>(
       `SELECT COALESCE(SUM(turn_count), 0) AS turns FROM scenes
-        WHERE created_at >= ? AND created_at <= ? ${scnClause}`,
+        WHERE 1=1 ${scnClause}`,
     )
-    .get(since, until, ...scnBind) ?? { turns: 0 };
+    .get(...scnBind) ?? { turns: 0 };
 
-  // 发言消息数：当前不含 msgClass 列，视为 0（需 mesh 事件流才能精确区分 cue/发言）。
-  const utteranceMessages = 0;
+  // 发言消息数需 mesh 事件流精确区分 cue/发言，当前不可得（R35：不以 0 占位，标 null）。
+  const utteranceMessages: number | null = null;
   const audiencePerUtterance =
-    utteranceMessages > 0 && roleOnly.deliveriesTotal > 0
+    utteranceMessages !== null && utteranceMessages > 0 && roleOnly.deliveriesTotal > 0
       ? roleOnly.deliveriesTotal / utteranceMessages
       : null;
 
@@ -164,10 +188,9 @@ export function buildCostView(
     roleDb
       .prepare<unknown[], { scene_id: string }>(
         `SELECT scene_id FROM scenes
-          WHERE token_budget IS NOT NULL AND token_spent > token_budget
-            AND created_at >= ? AND created_at <= ? ${scnClause}`,
+          WHERE token_budget IS NOT NULL AND token_spent > token_budget ${scnClause}`,
       )
-      .all(since, until, ...scnBind)
+      .all(...scnBind)
   ).map((r) => r.scene_id);
 
   const budgetRow = roleDb
@@ -175,14 +198,15 @@ export function buildCostView(
       `SELECT COALESCE(SUM(token_budget), NULL) AS tokenBudget,
               COALESCE(SUM(token_spent), 0)     AS tokenSpent
          FROM scenes
-        WHERE created_at >= ? AND created_at <= ? ${scnClause}`,
+        WHERE 1=1 ${scnClause}`,
     )
-    .get(since, until, ...scnBind) ?? { tokenBudget: null, tokenSpent: 0 };
+    .get(...scnBind) ?? { tokenBudget: null, tokenSpent: 0 };
 
   return {
     window: { since, until },
     windowClampedTo: { since, until },
     scope: { sceneIds: scopeSceneIds, agentIds: scopeAgentIds },
+    caveats,
     meshCounters,
     roleOnly: {
       messagesTotal: roleOnly.messagesTotal,
@@ -196,7 +220,7 @@ export function buildCostView(
     roleNormalized: {
       turns: scnRow.turns,
       utteranceMessages,
-      verbatimPerTurn: scnRow.turns > 0 ? 0 : null, // 需 mesh 事件流的 verbatimCopies，当前不可得
+      verbatimPerTurn: null, // 需 mesh 事件流的 verbatimCopies，当前不可得（R35：不以 0 占位）
       verbatimPerUtterance: null,
       audiencePerUtterance,
     },
@@ -217,9 +241,9 @@ export function buildCostView(
         episodesWritten: reflRow.episodesWritten,
         profilesTouched: reflRow.profilesTouched,
         wallMsTotal: reflRow.wallMsTotal,
-        meshMessages: 0, // 需 mesh 事件流
-        meshDeliveries: 0,
-        meshWakes: 0,
+        meshMessages: null, // 需 mesh 事件流归因，当前不可得（R35：不以 0 占位）
+        meshDeliveries: null,
+        meshWakes: null,
       },
       sceneBudget: {
         tokenBudget: budgetRow.tokenBudget,

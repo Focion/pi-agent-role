@@ -14,6 +14,7 @@ import type Database from "better-sqlite3";
 
 import { newId } from "../runtime/id.js";
 import { KNOWLEDGE_DECAY, MASTERY_FACTOR, type EvidenceKind, type LearningQueueItem, type Mastery } from "./types.js";
+import { modelConfigHashFromJson } from "../compile/fingerprint.js";
 
 const clamp01 = (x: number): number => (x < 0 ? 0 : x > 1 ? 1 : x);
 
@@ -35,6 +36,10 @@ export interface KnowledgeItemRow {
   sourceKind: string | null;
   sourceMsgId: string | null;
   firstSeenAt: string;
+  /** fading 由哪个掌握度降来（A14 恢复晋级上限；非 fading 时为 null）。 */
+  decayFrom: Mastery | null;
+  /** 上一轮衰减节拍的虚拟小时（A32 幂等基线）；从未衰减为 null。 */
+  lastDecayVhours: number | null;
 }
 
 /** 一条知识事件的写入载荷。 */
@@ -89,6 +94,16 @@ export class KnowledgeDao {
     this.nowReal = opts.nowReal;
   }
 
+  /** 写时刻该 agent 的定稿模型配置哈希（R06 E09）；无 model_config_json 返回 null。 */
+  private configHashFor(owner: string): string | null {
+    const row = this.db
+      .prepare<[string], { model_config_json: string | null }>(
+        `SELECT model_config_json FROM agents WHERE agent_id = ?`,
+      )
+      .get(owner);
+    return modelConfigHashFromJson(row?.model_config_json ?? null);
+  }
+
   // ─── 读 ────────────────────────────────────────────────────────────────────
 
   item(owner: string, topic: string): KnowledgeItemRow | undefined {
@@ -97,7 +112,7 @@ export class KnowledgeDao {
         `SELECT kn_id, owner_agent, topic, claim, mastery, confidence, retention,
                 practice_count, last_practiced_at, last_practiced_vhours,
                 is_misconception, wrong_belief, taught_by, source_kind, source_msg_id,
-                first_seen_at
+                first_seen_at, decay_from, last_decay_vhours
            FROM knowledge_items WHERE owner_agent = ? AND topic = ?`,
       )
       .get(owner, topic);
@@ -119,6 +134,8 @@ export class KnowledgeDao {
       sourceKind: (r.source_kind as string | null) ?? null,
       sourceMsgId: (r.source_msg_id as string | null) ?? null,
       firstSeenAt: r.first_seen_at as string,
+      decayFrom: (r.decay_from as Mastery | null) ?? null,
+      lastDecayVhours: (r.last_decay_vhours as number | null) ?? null,
     };
   }
 
@@ -129,7 +146,7 @@ export class KnowledgeDao {
         `SELECT kn_id, owner_agent, topic, claim, mastery, confidence, retention,
                 practice_count, last_practiced_at, last_practiced_vhours,
                 is_misconception, wrong_belief, taught_by, source_kind, source_msg_id,
-                first_seen_at
+                first_seen_at, decay_from, last_decay_vhours
            FROM knowledge_items WHERE owner_agent = ? ORDER BY last_practiced_vhours DESC`,
       )
       .all(owner);
@@ -150,6 +167,8 @@ export class KnowledgeDao {
       sourceKind: (r.source_kind as string | null) ?? null,
       sourceMsgId: (r.source_msg_id as string | null) ?? null,
       firstSeenAt: r.first_seen_at as string,
+      decayFrom: (r.decay_from as Mastery | null) ?? null,
+      lastDecayVhours: (r.last_decay_vhours as number | null) ?? null,
     }));
   }
 
@@ -197,6 +216,7 @@ export class KnowledgeDao {
 
   /** 原子写一次迁移：item 的 insert/update + 事件，单事务（§13.4.3 ⑥）。 */
   applyChange(c: KnowledgeChange): void {
+    const modelConfigHash = c.isNew ? this.configHashFor(c.owner) : null;
     const tx = this.db.transaction(() => {
       if (c.isNew) {
         this.db
@@ -209,7 +229,7 @@ export class KnowledgeDao {
             VALUES (@knId, @owner, @topic, @claim, @mastery, @confidence, @retention,
                     @practiceCount, @lastPracticedAt, @lastPracticedVhours,
                     @isMisconception, @wrongBelief, @taughtBy, @sourceKind, NULL,
-                    @firstSeenAt, @updatedAt, NULL)
+                    @firstSeenAt, @updatedAt, @modelConfigHash)
           `)
           .run({
             knId: c.knId,
@@ -228,6 +248,7 @@ export class KnowledgeDao {
             sourceKind: c.sourceKind,
             firstSeenAt: c.firstSeenAt,
             updatedAt: this.nowReal(),
+            modelConfigHash,
           });
       } else {
         this.db
@@ -237,7 +258,8 @@ export class KnowledgeDao {
                    retention = @retention, practice_count = @practiceCount,
                    last_practiced_at = @lastPracticedAt, last_practiced_vhours = @lastPracticedVhours,
                    is_misconception = @isMisconception, wrong_belief = @wrongBelief,
-                   taught_by = @taughtBy, updated_at = @updatedAt
+                   taught_by = @taughtBy, updated_at = @updatedAt,
+                   decay_from = NULL
              WHERE kn_id = @knId AND owner_agent = @owner
           `)
           .run({
@@ -304,7 +326,7 @@ export class KnowledgeDao {
         VALUES (@knId, @owner, @topic, @claim, @mastery, 0.5, 1.0,
                 0, NULL, 0,
                 @isMisconception, @wrongBelief, 'self', 'template_seed', @sourceMsgId,
-                @firstSeenAt, @updatedAt, NULL)
+                @firstSeenAt, @updatedAt, @modelConfigHash)
         ON CONFLICT (owner_agent, topic) DO NOTHING
       `)
       .run({
@@ -313,6 +335,7 @@ export class KnowledgeDao {
         topic: row.topic,
         claim: row.claim,
         mastery: row.mastery,
+        modelConfigHash: this.configHashFor(row.owner),
         isMisconception: row.isMisconception ? 1 : 0,
         wrongBelief: row.wrongBelief ?? null,
         sourceMsgId: row.sourceMsgId ?? null,
@@ -327,17 +350,22 @@ export class KnowledgeDao {
    * 知识衰减：T7（retention<0.35 → fading）+ T8（fading 且 <0.10 → forgotten）。
    * 与 §17.5 的三段 SQL 语义一致，用 JS 环路保持对「旧→新阈值」的可观测；每条降级
    * 各写一条 evidence_kind='decay' 事件。mastery=forgotten 的行不再参与。
+   *
+   * A32 幂等：`last_decay_vhours` 已到当前虚拟小时的行跳过，不重算——否则同一 now 连扫两次
+   * 会用「当前(fading)」的较小 factor 把刚 fading 的行再压低到 forgotten，遗忘结果取决于
+   * 扫描次数。A14：T7 转 fading 时把衰减前状态记进 `decay_from`，供自省恢复时封顶晋级。
    */
   decay(owner: string, nowVirtualHours: number, tau0Hours: number): KnowledgeDecayResult {
     const rows = this.db
-      .prepare<[string], { kn_id: string; mastery: Mastery; retention: number; practice_count: number; last_practiced_vhours: number }>(
-        `SELECT kn_id, mastery, retention, practice_count, last_practiced_vhours
+      .prepare<[string], { kn_id: string; mastery: Mastery; retention: number; practice_count: number; last_practiced_vhours: number; decay_from: Mastery | null; last_decay_vhours: number | null }>(
+        `SELECT kn_id, mastery, retention, practice_count, last_practiced_vhours, decay_from, last_decay_vhours
            FROM knowledge_items WHERE owner_agent = ? AND mastery <> 'forgotten'`,
       )
       .all(owner);
 
     const upd = this.db.prepare(
-      `UPDATE knowledge_items SET mastery = @m, retention = @r, updated_at = @now
+      `UPDATE knowledge_items
+          SET mastery = @m, retention = @r, decay_from = @df, last_decay_vhours = @dvh, updated_at = @now
         WHERE owner_agent = @o AND kn_id = @id`,
     );
     const insEvent = this.db.prepare(`
@@ -357,6 +385,9 @@ export class KnowledgeDao {
 
     const tx = this.db.transaction(() => {
       for (const row of rows) {
+        // A32：此节拍已扫过（含更晚节拍）→ 幂等跳过，不再换小 factor 重算。
+        if (row.last_decay_vhours !== null && row.last_decay_vhours >= nowVirtualHours) continue;
+
         const dt = Math.max(0, nowVirtualHours - row.last_practiced_vhours);
         const tau =
           tau0Hours *
@@ -365,7 +396,8 @@ export class KnowledgeDao {
         const retention = clamp01(Math.exp(-dt / tau));
 
         let mastery = row.mastery;
-        // T7：understood/applied/mastered 跌破 fade 阈值 → fading。
+        let decayFrom = row.decay_from ?? null;
+        // T7：understood/applied/mastered 跌破 fade 阈值 → fading；记录衰减前状态（A14）。
         if ((mastery === "understood" || mastery === "applied" || mastery === "mastered") && retention < KNOWLEDGE_DECAY.fade) {
           insEvent.run({
             evId: newId("ke"),
@@ -377,9 +409,10 @@ export class KnowledgeDao {
             now: this.nowReal(),
           });
           result.newlyFading.push(row.kn_id);
+          decayFrom = mastery;
           mastery = "fading";
         }
-        // T8：fading（含本轮刚转的）跌破 forget 阈值 → forgotten。
+        // T8：fading（含本轮刚转的）跌破 forget 阈值 → forgotten（decay_from 不再需要）。
         if (mastery === "fading" && retention < KNOWLEDGE_DECAY.forget) {
           insEvent.run({
             evId: newId("ke"),
@@ -391,10 +424,19 @@ export class KnowledgeDao {
             now: this.nowReal(),
           });
           result.newlyForgotten.push(row.kn_id);
+          decayFrom = null;
           mastery = "forgotten";
         }
 
-        upd.run({ m: mastery, r: retention, o: owner, id: row.kn_id, now: this.nowReal() });
+        upd.run({
+          m: mastery,
+          r: retention,
+          df: decayFrom,
+          dvh: nowVirtualHours,
+          o: owner,
+          id: row.kn_id,
+          now: this.nowReal(),
+        });
       }
     });
     tx();
@@ -420,29 +462,36 @@ export class KnowledgeDao {
    * 最近一次自省留下的学习队列（§17.5.2：存在 reflections.output_json）。供场景 open 时
    * 注入瞬时上下文读取。无 / 非法（缺 output_json 或 learningQueue 非数组）一律回空队列，
    * 读取端不把缺数据当错误。
+   *
+   * A35：只看 status='done' 的反射，按 started_at 从新到旧扫描，取第一条含合法
+   * learningQueue 的记录——失败的反射（status='failed'，output_json={error}）与「已 done 但
+   * 没带 learningQueue」的更早反射都不会被误当成最新队列。
    */
   lastLearningQueue(owner: string): LearningQueueItem[] {
-    const row = this.db
+    const rows = this.db
       .prepare<[string], { output_json: string | null }>(
         `SELECT output_json FROM reflections
-          WHERE owner_agent = ? AND output_json IS NOT NULL
-          ORDER BY started_at DESC LIMIT 1`,
+          WHERE owner_agent = ? AND status = 'done' AND output_json IS NOT NULL
+          ORDER BY started_at DESC`,
       )
-      .get(owner);
-    if (!row?.output_json) return [];
-    try {
-      const parsed = JSON.parse(row.output_json) as { learningQueue?: unknown };
-      if (!Array.isArray(parsed.learningQueue)) return [];
-      return (parsed.learningQueue as Array<Record<string, unknown>>)
-        .filter((x) => x && typeof x === "object" && typeof x.topic === "string")
-        .map((x) => ({
-          topic: String(x.topic),
-          priority: x.priority === "high" || x.priority === "medium" || x.priority === "low" ? x.priority : "medium",
-          motivation: typeof x.motivation === "string" ? x.motivation.slice(0, 200) : "",
-        }));
-    } catch {
-      return [];
+      .all(owner);
+    for (const row of rows) {
+      if (!row.output_json) continue;
+      try {
+        const parsed = JSON.parse(row.output_json) as { learningQueue?: unknown };
+        if (!Array.isArray(parsed.learningQueue)) continue;
+        return (parsed.learningQueue as Array<Record<string, unknown>>)
+          .filter((x) => x && typeof x === "object" && typeof x.topic === "string")
+          .map((x) => ({
+            topic: String(x.topic),
+            priority: x.priority === "high" || x.priority === "medium" || x.priority === "low" ? x.priority : "medium",
+            motivation: typeof x.motivation === "string" ? x.motivation.slice(0, 200) : "",
+          }));
+      } catch {
+        continue;
+      }
     }
+    return [];
   }
 
   stateWrite(row: {

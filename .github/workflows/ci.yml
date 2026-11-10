@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  gate:
+    name: check imports · typecheck · test · build
+    runs-on: ubuntu-latest
+    steps:
+      # 双库布局：@pi/agent-mesh 以 file:../pi-agent-mesh 引用同级仓库，
+      # CI 里把两个仓库并排 checkout 到工作区根目录还原本地目录结构。
+      - name: Checkout role repo
+        uses: actions/checkout@v4
+        with:
+          path: pi-agent-role
+
+      - name: Checkout peer mesh repo
+        uses: actions/checkout@v4
+        with:
+          repository: Focion/pi-agent-mesh
+          path: pi-agent-mesh
+
+      - name: Set up Node 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: |
+            pi-agent-role/package-lock.json
+            pi-agent-mesh/package-lock.json
+
+      # mesh 侧先建出 dist（file: 依赖按目录 symlink，npm ci 不会替它跑 build）。
+      - name: Build peer mesh
+        working-directory: pi-agent-mesh
+        run: |
+          npm ci
+          npm run build
+
+      - name: Install role deps
+        working-directory: pi-agent-role
+        run: npm ci
+
+      # 六项源码静态门禁 + 类型检查。
+      - name: Static gates
+        working-directory: pi-agent-role
+        run: |
+          npm run check:imports
+          npm run typecheck
+
+      # 全量 Vitest（真实模型用例在无 PI_ROLE_REAL_MODEL 时自动 skip，零费用）。
+      - name: Tests
+        working-directory: pi-agent-role
+        run: npm test
+
+      - name: Build dist
+        working-directory: pi-agent-role
+        run: npm run build

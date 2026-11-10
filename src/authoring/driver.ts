@@ -22,6 +22,7 @@ import { mkdir, rename } from "node:fs/promises";
 import { join } from "node:path";
 
 import { readYamlFile, stringifyYaml } from "../compile/yaml.js";
+import { assertContained, assertSafeSegment } from "../compile/path-guard.js";
 import { ValidationError } from "../runtime/errors.js";
 import { neverInferFiles, schemaFor } from "./schema.js";
 import { makeBlueprintTools, type BlueprintTools } from "./tools.js";
@@ -338,7 +339,11 @@ export function createBlueprintAuthor(deps: { root: string }): BlueprintAuthor {
     },
 
     async promote(stagingId: string, opts?: PromoteInput): Promise<PromoteResult> {
+      // A02：stagingId 直接 join，`../../../outside` 可越出 staging 白名单。先校验为单段，
+      // 再做包含复核，任何越权字面量在拼路径前被拒。
+      assertSafeSegment(stagingId, "stagingId");
       const stagingDir = join(root, "staging", stagingId);
+      assertContained(join(root, "staging"), stagingDir, "staging directory");
       if (!existsSync(stagingDir)) throw new ValidationError(`staging not found: ${stagingId}`);
       const metaPath = join(stagingDir, META_FILE);
       if (!existsSync(metaPath)) throw new ValidationError(`staging has no provenance meta: ${stagingId}`);
@@ -347,8 +352,12 @@ export function createBlueprintAuthor(deps: { root: string }): BlueprintAuthor {
       const tools = makeBlueprintTools({ stagingDir, schema });
 
       const targetId = (opts?.targetId && opts.targetId.trim() !== "" ? opts.targetId.trim() : meta.suggestedId) || `${meta.kind}-${stagingId.slice(0, 8)}`;
+      // A02：targetId（opts.targetId 或 provenance 里的 suggestedId）是外部输入却拼进
+      // templateRoot 路径，必须先校验为单段再做包含复核。
+      assertSafeSegment(targetId, "targetId");
       const templateRoot = join(root, "templates", meta.kind === "identity" ? "identities" : "facilities");
       const targetDir = join(templateRoot, targetId);
+      assertContained(templateRoot, targetDir, "target blueprint directory");
 
       // 第 2 步：目标 id 冲突检查，不合并/不覆盖/不加后缀（§24.6）。
       if (existsSync(targetDir)) throw new ValidationError(`target blueprint already exists: ${targetId}`);
@@ -374,10 +383,11 @@ export function createBlueprintAuthor(deps: { root: string }): BlueprintAuthor {
       const report = await tools.validate();
       if (!report.ok) throw new ValidationError(`blueprint validation failed on promote: ${report.errors.join("; ")}`);
 
-      // 卸掉隐藏元数据（不随 rename 进入蓝本目录），再原子 rename（§24.6 第 5 步）。
-      rmSync(metaPath, { force: true });
+      // 卸掉隐藏元数据（不随 rename 进入蓝本目录）。A16：先 rename 成功后再删 meta，
+      // 不能 rename 前就 rmSync——否则 mkdir/rename 失败会丢 provenance，staging 无法再 promote。
       await mkdir(templateRoot, { recursive: true });
       await rename(stagingDir, targetDir);
+      rmSync(join(targetDir, META_FILE), { force: true });
 
       return { targetId, blueprintDir: targetDir, provenancePath: join(targetDir, PROVENANCE_FILE), provenance };
     },

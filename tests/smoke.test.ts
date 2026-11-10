@@ -18,7 +18,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
-import { createRuntime } from "../src/index.js";
+import { createRuntimeInternals } from "../src/runtime/runtime.js";
 import { stringifyYaml } from "../src/compile/yaml.js";
 import type { RuntimeInternals } from "../src/runtime/runtime.js";
 
@@ -51,7 +51,7 @@ describe("P0 smoke (§25.1): two role agents exchange 10 messages", () => {
     const dir = mkdtempSync(join(tmpdir(), "pi-role-p0-"));
     writeBlueprint(join(dir, "templates", "minimal"));
 
-    const rt = (await createRuntime({
+    const rt = (await createRuntimeInternals({
       root: dir,
       db: join(dir, "role-agent.db"),
       devMode: true,

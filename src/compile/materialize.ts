@@ -3,7 +3,8 @@
 //
 // 把一份只读蓝本目录（git 管理、人可读可改的 YAML 目录，§4.1）复制成某个 agent 专属的
 // 可写「实例模板」目录，并可选地打上一层 JSON Merge Patch（RFC 7386）overlay。
-// 物化落点：<root>/agents/<agentId>/identity/。
+// 物化落点：<root>/agents/<agentId>/<targetDirName>/（角色 targetDirName="identity"，
+// 设施 "facility"，§6.1）。
 //
 // 职责边界：
 //   · 蓝本 → 实例模板 只是一次「复制 + 打补丁」，不解析、不编译基因——身份编译是
@@ -13,21 +14,24 @@
 //     （agents.create() 会先行拦截，这里再兜底一道硬约束）。
 // ═══════════════════════════════════════════════════════════════════════════
 
-import { existsSync } from "node:fs";
+import { existsSync, rmSync } from "node:fs";
 import { cp, mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import { hashDirectoryContents, listFiles } from "./fingerprint.js";
+import { assertContained, assertSafeSegment } from "./path-guard.js";
 import { readYamlFile, stringifyYaml } from "./yaml.js";
 import { ValidationError } from "../runtime/errors.js";
 
-/** materialize 入参：蓝本目录 + 工作根 + agentId + 可选 overlay。 */
+/** materialize 入参：蓝本目录 + 工作根 + agentId + 可选 overlay + 目标子目录名。 */
 export interface MaterializeInput {
   /** 蓝本目录（只读，git 管理）。 */
   blueprintDir: string;
-  /** 工作根，最终物化到 <root>/agents/<agentId>/identity/。 */
+  /** 工作根，最终物化到 <root>/agents/<agentId>/<targetDirName>/。 */
   root: string;
   agentId: string;
+  /** 物化点子目录名（§6.1）：角色 "identity"（缺省），设施 "facility"。 */
+  targetDirName?: string;
   /**
    * JSON-merge-patch。top-level key = 维度文件名去 .yaml 后缀（如 "personal"），
    * 值合并进该 YAML 文件。
@@ -37,7 +41,7 @@ export interface MaterializeInput {
 
 /** materialize 产出：实例模板落点 + 复制清单 + 被 overlay 改动的维度 + 蓝本血缘哈希。 */
 export interface MaterializeResult {
-  /** <root>/agents/<agentId>/identity。 */
+  /** <root>/agents/<agentId>/<targetDirName>（实例模板落点）。 */
   identityDir: string;
   /** 相对 identityDir 的文件列表（已排序）。 */
   filesCopied: string[];
@@ -76,7 +80,13 @@ function applyMergePatch(target: unknown, patch: unknown): unknown {
  * 蓝本哈希在复制前计算；重复物化同一 agentId 抛 ValidationError。
  */
 export async function materialize(input: MaterializeInput): Promise<MaterializeResult> {
-  const identityDir = join(input.root, "agents", input.agentId, "identity");
+  // A01：agentId 是外部输入却直接拼进路径，`../../outside` 可越出 root。先校验为单段，
+  // 再做 resolve 后包含复核，任何越权字面量在此被拒，绝不落到 existsSync/mkdir/cp。
+  assertSafeSegment(input.agentId, "agentId");
+  const targetDirName = input.targetDirName ?? "identity";
+  assertSafeSegment(targetDirName, "targetDirName");
+  const identityDir = join(input.root, "agents", input.agentId, targetDirName);
+  assertContained(join(input.root, "agents"), identityDir, "agent instance directory");
 
   if (existsSync(identityDir)) {
     throw new ValidationError(
@@ -87,29 +97,39 @@ export async function materialize(input: MaterializeInput): Promise<MaterializeR
   // 蓝本哈希必须在复制前算，反映蓝本而非副本（§6.1 血缘）。
   const blueprintHash = await hashDirectoryContents(input.blueprintDir);
 
-  await mkdir(join(input.root, "agents", input.agentId), { recursive: true });
-  await cp(input.blueprintDir, identityDir, { recursive: true });
+  // A15：cp 成功后 overlay/listFiles 失败会遗留半成品 identityDir，同 ID 重试被
+  // 「已存在」永久卡死。此目录刚确认不存在、由本调用创建并完全拥有，故失败只清理这个
+  // 自己创建的目录（agentId 已过段校验，路径不可能越出 root），绝不触碰既有用户文件。
+  try {
+    await mkdir(join(input.root, "agents", input.agentId), { recursive: true });
+    await cp(input.blueprintDir, identityDir, { recursive: true });
 
-  const overlayApplied: string[] = [];
-  if (input.overlay) {
-    for (const key of Object.keys(input.overlay)) {
-      const targetPath = join(identityDir, `${key}.yaml`);
-      const existing = readYamlFile<Record<string, unknown>>(targetPath);
-      if (existing === undefined) {
-        throw new ValidationError(`overlay targets missing dimension file: ${key} (${targetPath})`);
+    const overlayApplied: string[] = [];
+    if (input.overlay) {
+      for (const key of Object.keys(input.overlay)) {
+        // A01：overlay 维度名同样拼进路径，必须同为安全段，再做包含复核。
+        assertSafeSegment(key, "overlay dimension");
+        const targetPath = assertContained(identityDir, join(identityDir, `${key}.yaml`), "overlay target");
+        const existing = readYamlFile<Record<string, unknown>>(targetPath);
+        if (existing === undefined) {
+          throw new ValidationError(`overlay targets missing dimension file: ${key} (${targetPath})`);
+        }
+        const merged = applyMergePatch(existing, input.overlay[key]);
+        await writeFile(targetPath, stringifyYaml(merged), "utf8");
+        overlayApplied.push(key);
       }
-      const merged = applyMergePatch(existing, input.overlay[key]);
-      await writeFile(targetPath, stringifyYaml(merged), "utf8");
-      overlayApplied.push(key);
     }
+
+    const filesCopied = await listFiles(identityDir);
+
+    return {
+      identityDir,
+      filesCopied,
+      overlayApplied: overlayApplied.sort(),
+      blueprintHash,
+    };
+  } catch (err) {
+    rmSync(identityDir, { recursive: true, force: true });
+    throw err;
   }
-
-  const filesCopied = await listFiles(identityDir);
-
-  return {
-    identityDir,
-    filesCopied,
-    overlayApplied: overlayApplied.sort(),
-    blueprintHash,
-  };
 }

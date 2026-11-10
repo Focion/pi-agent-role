@@ -73,7 +73,7 @@ describe("T5 isolation / security (§21.3.5)", () => {
       backend: {
         async create(ctx) {
           captured.surface = toolSurfaceKey(ctx.tools);
-          return { session: {}, piSessionId: "p1" };
+          return { session: {}, runtimeRef: "p1" };
         },
         async open(ctx) {
           captured.surface = toolSurfaceKey(ctx.tools);
@@ -99,5 +99,46 @@ describe("T5 isolation / security (§21.3.5)", () => {
       const code = src.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/[^\n]*/g, "");
       expect(/\bext\b/.test(code), `${f} reads ext identifier`).toBe(false);
     }
+  });
+
+  it("A19: mesh_send 装饰在调用 extProvider 时传真实 accountId（非空串）", async () => {
+    const received: Array<{ ext: unknown }> = [];
+    // 自备 mesh_send：execute 记录被装饰后的入参，供断言 ext 补齐值。
+    const recordSend = {
+      name: "mesh_send",
+      description: "",
+      parameters: {} as Record<string, unknown>,
+      execute: async (toolCallId: string, params: Record<string, unknown>): Promise<{ content: string }> => {
+        received.push({ ext: params.ext });
+        return { content: "" };
+      },
+    };
+    const myTools = [recordSend, ...ALL_BUILTINS.filter((t) => t.name !== "mesh_send")];
+
+    let decoratedSend: ((id: string, params: unknown) => Promise<unknown>) | undefined;
+    const sf = makeSessionFactory({
+      classify: () => "role",
+      extProvider: (accountId) => ({ sceneId: `sc-${accountId}`, turn: 3, virtualTs: "W1D1T8" }),
+      backend: {
+        async create(ctx) {
+          decoratedSend = ctx.tools.find((t) => t.name === "mesh_send")?.execute as
+            | ((id: string, params: unknown) => Promise<unknown>)
+            | undefined;
+          return { session: {}, runtimeRef: "a19" };
+        },
+        async open() {
+          return { session: {} };
+        },
+      },
+    });
+
+    await sf.create({ account: { id: "alice" }, endpoint: { id: "ep-a" }, tools: myTools } as never);
+    expect(decoratedSend).toBeDefined();
+
+    await decoratedSend!("tc-1", { text: "hi" });
+
+    expect(received).toHaveLength(1);
+    // 旧缺陷：extProvider("") 会拿到空账号 → sceneId 变成 "sc-"；现在必须是真实账号 "alice"。
+    expect(received[0]!.ext).toMatchObject({ sceneId: "sc-alice", turn: 3, virtualTs: "W1D1T8" });
   });
 });

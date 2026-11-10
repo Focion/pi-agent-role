@@ -4,7 +4,8 @@
 // 三处必须这样写，否则测试在真环境静默失效：
 // ① deliver 第五参是 opts:{triggerTurn}，不是 wake:boolean（§7.1 正交）
 // ② status() 不报 queueDepth（F3：pi 队列深度对库消息失明）
-// ③ deliver 同步回吐 entry_appended（F2/F5：delivered→consumed 的归因依据）
+// ③ deliver 返回 SubmissionHandle（submissionId/status/entryId），submissionStatus
+//    可按 id 精确对账（§8.4）；fake 同步落 entry，返回 status="done"（M03 最小投影）
 //
 // 位于 `src/mesh/`：`createRuntime({fake:{streamPort:true}})` 要在运行期构造它，
 // 且它是 `StreamPort` 边界的同层零件，故落在 mesh 层而非 tests/。
@@ -19,6 +20,8 @@ import type {
   PortEntryEvent,
   PortStatus,
   StreamPort,
+  SubmissionHandle,
+  SubmissionRecord,
   Unsubscribe,
 } from "@pi/agent-mesh/core";
 
@@ -46,6 +49,8 @@ export class FakeStreamPort implements StreamPort {
   private turnEndHandlers: Array<(e: { endpointId: EndpointId }) => void> = [];
   private seqCounters = new Map<EndpointId, number>();
   private handoff = new Map<EndpointId, number>();
+  /** deliver → submission 投影（M03：可对账的最小假状态机，id → SubmissionRecord）。 */
+  private submissions = new Map<string, SubmissionRecord>();
 
   setEndpointState(id: EndpointId, state: EndpointState): void {
     this.states.set(id, state);
@@ -66,9 +71,10 @@ export class FakeStreamPort implements StreamPort {
     rendered: string,
     envelope: Envelope,
     grade: Grade,
-    opts?: { triggerTurn?: boolean },
-  ): Promise<{ entryId?: string }> {
+    opts?: { triggerTurn?: boolean; deliveryId?: string; attempt?: number },
+  ): Promise<SubmissionHandle> {
     const entryId = `fake_${this.delivered.length + 1}`;
+    const submissionId = `sub_${this.delivered.length + 1}`;
     this.delivered.push({ endpointId, envelope, rendered, grade, triggerTurn: !!opts?.triggerTurn, entryId });
     const seq = (this.seqCounters.get(endpointId) ?? 0) + 1;
     this.seqCounters.set(endpointId, seq);
@@ -84,9 +90,16 @@ export class FakeStreamPort implements StreamPort {
     this.handoff.set(endpointId, (this.handoff.get(endpointId) ?? 1) - 1);
     if (opts?.triggerTurn) {
       this.busy.add(endpointId);
-      queueMicrotask(() => this.endTurn(endpointId));
+      // 用 setTimeout 而非 queueMicrotask：确保 await deliver() 的 continuation（markDelivered）
+      // 在 microtask 阶段跑完后，endTurn 才在下一 macrotask 触发 handleTurnEnd → consumed。
+      // 否则 microtask 先于 promise continuation 执行，handleTurnEnd 查不到 delivered 行，永不消费。
+      setTimeout(() => this.endTurn(endpointId), 0);
     }
-    return { entryId };
+    // M01/M03：fake 同步落 entry，到返回时已结进转录 → status="done"、type="write"（与 mesh
+    // tests/helpers/fake-stream-port 同构）。完整确定性状态机（queued→placed→done/unanswered）、
+    // 分账与 deliveryId/attempt 归因在 WP05 落。
+    this.submissions.set(submissionId, { id: submissionId, status: "done", entryId, type: "write" });
+    return { submissionId, status: "done", entryId };
   }
 
   async nudge(
@@ -97,7 +110,7 @@ export class FakeStreamPort implements StreamPort {
     this.nudges.push({ endpointId, cue, opts });
     if (opts?.triggerTurn) {
       this.busy.add(endpointId);
-      queueMicrotask(() => this.endTurn(endpointId));
+      setTimeout(() => this.endTurn(endpointId), 0);
     }
   }
 
@@ -127,9 +140,8 @@ export class FakeStreamPort implements StreamPort {
     };
   }
 
-  async hasEntries(_endpointId: string, entryIds: string[]): Promise<Set<string>> {
-    const live = new Set(this.delivered.map((d) => d.entryId));
-    return new Set(entryIds.filter((e) => live.has(e)));
+  async submissionStatus(_endpointId: string, submissionId: string): Promise<SubmissionRecord | null> {
+    return this.submissions.get(submissionId) ?? null;
   }
 
   onEntry(h: (e: PortEntryEvent) => void): Unsubscribe {
@@ -154,7 +166,13 @@ export class FakeStreamPort implements StreamPort {
 
   endTurn(endpointId: EndpointId): void {
     this.busy.delete(endpointId);
-    for (const h of [...this.turnEndHandlers]) h({ endpointId });
+    for (const h of [...this.turnEndHandlers]) {
+      try {
+        h({ endpointId });
+      } catch {
+        // 吞错：测试 teardown 可能已关 store/host，turn_end 派发在清理后仍可能到达。
+      }
+    }
   }
 
   /** 统计 triggerTurn===true 的投递次数（P1 验收指标的分子） */

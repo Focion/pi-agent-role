@@ -55,7 +55,12 @@ function dialogue(overrides: Partial<ModelConfig["dialogue"]> = {}): ModelConfig
 }
 
 /** 组装一条持久化注册行（§18.2 恢复期 agentMeta 的形态）。 */
-function rehydrated(agentId: string, identityDir: string, modelConfig: ModelConfig): RehydratedAgent {
+function rehydrated(
+  agentId: string,
+  identityDir: string,
+  modelConfig: ModelConfig,
+  opts: { reflectAccountId?: string } = {},
+): RehydratedAgent {
   return {
     agentId,
     agentType: "role",
@@ -71,8 +76,8 @@ function rehydrated(agentId: string, identityDir: string, modelConfig: ModelConf
     status: "active",
     meshAccountId: agentId,
     meshEndpointId: "ep-1",
-    reflectAccountId: null,
-    reflectEndpointId: null,
+    reflectAccountId: opts.reflectAccountId ?? null,
+    reflectEndpointId: opts.reflectAccountId ? "ep-1-reflect" : null,
   };
 }
 
@@ -140,5 +145,68 @@ describe("P1 pi 绑定解析 (§3.7 ① / §18.2.1)", () => {
     const root = mkdtempSync(join(tmpdir(), "pi-role-bind-none-"));
     const resolver = makeBindingResolver(root, new Map());
     await expect(resolver.resolve("ghost")).resolves.toBeUndefined();
+  });
+
+  it("A03 create 路径：register 一并对自省流账号落绑定（独立 reflection 模型 + 目录）", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pi-role-bind-reflect-"));
+    const identityDir = join(root, "agents", "ag-r", "identity");
+    writeIdentity(identityDir, "刘明涛");
+
+    const spec = await compileIdentity(identityDir, {
+      agentId: "ag-r",
+      modelConfig: {
+        dialogue: { provider: "anthropic", modelId: "claude-opus-5", thinkingLevel: "high" },
+        reflection: { modelId: "claude-haiku-4-5", thinkingLevel: "low" },
+        budget: { onExceed: "warn" },
+      },
+      compilerVersion: COMPILER_VERSION,
+    });
+
+    const resolver = makeBindingResolver(root, new Map());
+    resolver.register("ag-r", spec, { reflectAccountId: "ag-r:reflect" });
+
+    const reflect = await resolver.resolve("ag-r:reflect");
+    expect(reflect).toBeDefined();
+    // 独立 reflection 模型生效：显式叶子覆盖，未覆盖叶（provider）继承 dialogue。
+    expect(reflect!.modelId).toBe("claude-haiku-4-5");
+    expect(reflect!.thinkingLevel).toBe("low");
+    expect(reflect!.provider).toBe("anthropic");
+    // 主/自省独立目录（R05）。
+    expect(reflect!.sessionsDir).toBe(join(root, "agents", "ag-r", "sessions-reflect"));
+    expect(reflect!.systemPrompt).toBe(spec.systemPrompt);
+
+    // 主账号绑定保持不变（dialogue 模型 + sessions 目录）。
+    const main = await resolver.resolve("ag-r");
+    expect(main!.modelId).toBe("claude-opus-5");
+    expect(main!.sessionsDir).toBe(join(root, "agents", "ag-r", "sessions"));
+    // 自省流账号也能解析同一份记忆策略（与主账号同源）。
+    expect(await resolver.memoryPolicyOf("ag-r:reflect")).toBe(await resolver.memoryPolicyOf("ag-r"));
+  });
+
+  it("A03 恢复路径：reflectAccountId 经反查索引重编译出独立 reflection 绑定", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pi-role-bind-reflect-resolve-"));
+    const identityAbs = join(root, "agents", "ag-r2", "identity");
+    writeIdentity(identityAbs, "王老师");
+
+    const modelConfig: ModelConfig = {
+      dialogue: { provider: "anthropic", modelId: "claude-sonnet-5", thinkingLevel: "medium" },
+      reflection: { modelId: "claude-haiku-4-5" },
+      budget: { onExceed: "warn" },
+    };
+    const agent = rehydrated("ag-r2", "agents/ag-r2/identity", modelConfig, {
+      reflectAccountId: "ag-r2:reflect",
+    });
+    const resolver = makeBindingResolver(root, new Map([["ag-r2", agent]]));
+
+    const reflect = await resolver.resolve("ag-r2:reflect");
+    expect(reflect).toBeDefined();
+    expect(reflect!.modelId).toBe("claude-haiku-4-5");
+    // 继承 dialogue 的 thinkingLevel（reflection 未覆盖）。
+    expect(reflect!.thinkingLevel).toBe("medium");
+    expect(reflect!.identityDir).toBe(identityAbs);
+    expect(reflect!.sessionsDir).toBe(join(root, "agents", "ag-r2", "sessions-reflect"));
+
+    const main = await resolver.resolve("ag-r2");
+    expect(main!.modelId).toBe("claude-sonnet-5");
   });
 });

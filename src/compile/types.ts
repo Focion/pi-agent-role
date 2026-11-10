@@ -44,9 +44,17 @@ export interface ModelConfig {
   budget: ModelBudgetConfig;
 }
 
-/** 五层解析链（后者覆盖前者，全程无代码常量）。 */
+/** R06 setModelConfig 的运行期覆盖入参：每段都可只给叶子，主/自省/预算独立。 */
+export interface ModelConfigOverride {
+  dialogue?: Partial<ModelDialogueConfig>;
+  reflection?: Partial<ModelDialogueConfig>;
+  budget?: Partial<ModelBudgetConfig>;
+}
+
+/** 五层解析链（后者覆盖前者，全程无代码常量）+ 运行期宿主覆盖层（R06 setModelConfig）。 */
 export type ModelConfigLayer =
-  | "runtime_default" | "blueprint" | "roster" | "create_arg" | "scene_override";
+  | "runtime_default" | "blueprint" | "roster" | "create_arg" | "scene_override"
+  | "runtime_override";
 
 /** 每个叶子字段来自哪一层。key 是点分路径，如 "dialogue.modelId"（§5.4 末）。 */
 export type ModelConfigSource = Record<string, ModelConfigLayer>;
@@ -65,6 +73,40 @@ export interface AgentSpecMeshProjection {
     | { kind: "perConversation"; scope: "conversation" | "purpose"; key: string }
     | { kind: "pooled"; size: number; affinity?: "none" | "conversation" | "sender" };
   profileRef: string;                        // = `spec:${promptVersion}`
+}
+
+/**
+ * mesh 投影漂移（§4.6.2）：respec/一致性核对都只看 mesh 认识且注册后不可改的五个字段。
+ * `accountId`/`endpointClass`/`profileRef` 刻意不参与——accountId 是恒等约束（另查）、
+ * endpointClass 对角色恒 stream、profileRef 每次 respec 都随 promptVersion 合法变化。
+ */
+export type MeshProjectionDrift =
+  | { kind: "field"; field: "displayName" | "capabilities" | "initiate" | "defaultGrade"; from: unknown; to: unknown }
+  | { kind: "topology"; from: unknown; to: unknown };
+
+/** 比较两份 mesh 投影，返回 mesh 侧无法跟随的字段差异（capabilities/initiate 按集合序比，顺序不失真）。 */
+export function diffMeshProjection(
+  prev: AgentSpecMeshProjection,
+  next: AgentSpecMeshProjection,
+): MeshProjectionDrift[] {
+  const drift: MeshProjectionDrift[] = [];
+  if (prev.displayName !== next.displayName) {
+    drift.push({ kind: "field", field: "displayName", from: prev.displayName, to: next.displayName });
+  }
+  const sorted = (a: string[] | undefined): string[] => [...(a ?? [])].sort();
+  if (JSON.stringify(sorted(prev.capabilities)) !== JSON.stringify(sorted(next.capabilities))) {
+    drift.push({ kind: "field", field: "capabilities", from: prev.capabilities, to: next.capabilities });
+  }
+  if (JSON.stringify(sorted(prev.initiate)) !== JSON.stringify(sorted(next.initiate))) {
+    drift.push({ kind: "field", field: "initiate", from: prev.initiate, to: next.initiate });
+  }
+  if (prev.defaultGrade !== next.defaultGrade) {
+    drift.push({ kind: "field", field: "defaultGrade", from: prev.defaultGrade, to: next.defaultGrade });
+  }
+  if (JSON.stringify(prev.topology ?? null) !== JSON.stringify(next.topology ?? null)) {
+    drift.push({ kind: "topology", from: prev.topology, to: next.topology });
+  }
+  return drift;
 }
 
 // ─── 身份各维度（§5.1）──────────────────────────────────────────────────────
@@ -127,6 +169,8 @@ export interface MemoryPolicy {
   maxWritesPerTurn: number;
   p2Damping: number;                         // P2 路径打分折扣（§12.1.2②）
   tau0Hours: number;                         // 衰减时间常数基准，单位虚拟小时
+  /** §16.3.2 设施观察的感官过滤通道（由 narrative_voice.sensory.dominant_channel 编译）。 */
+  dominantChannel?: "visual" | "auditory" | "tactile" | "olfactory";
   reflection: {
     episodesPerReflection: number;
     trustDeltaCap: number;
@@ -148,6 +192,7 @@ export function defaultMemoryPolicy(): MemoryPolicy {
     maxWritesPerTurn: 3,
     p2Damping: 0.6,
     tau0Hours: 24 * 7,
+    dominantChannel: undefined,
     reflection: {
       episodesPerReflection: 6,
       trustDeltaCap: 0.15,
@@ -185,6 +230,68 @@ export interface AgentSpec {
 /** compileIdentity 的上下文（§5.1 恒定签名）。 */
 export interface CompileContext {
   agentId: string;
+  modelConfig: ModelConfig;
+  compilerVersion: string;
+}
+
+// ─── 设施编译器产物（§5.5）── 设施不是 persona，无身份编译；产物与 AgentSpec 并列 ──
+
+/** facility_record 的封闭三值 kind（§16 / 附录 F 第 10 号）。 */
+export type FacilityRecordKind = "usage" | "incident" | "maintenance";
+
+export interface FacilityLazySection {
+  section: string;                           // "basic" | "rules" | "capacity" | "services" | ...
+  description: string;
+  tokenEstimate: number;
+}
+
+/** protocol.yaml 编译产物：设施的能力宣告（发起权恒为空，§3.2）。 */
+export interface FacilityProtocol {
+  capabilities: string[];
+  initiate: MessageKind[];
+}
+
+/** state/ 的数字型状态 schema（§5.5 L2：不进 LLM 上下文，由 Projector 重算）。 */
+export interface FacilityStateSchema {
+  liveState: Record<string, unknown>;        // live.json 的 schema
+  digestWindow: number;                      // usage-digest 的聚合窗口
+}
+
+export interface FacilityInitialState {
+  /** 数字型事实（容量/占用/资源），落地后由 facility_record 流水继续追加。 */
+  liveState: Record<string, unknown>;
+  /** 蓝本声明的初始事实流水（records.yaml/初始状态）。 */
+  records: Array<{ kind: FacilityRecordKind; data: Record<string, unknown> }>;
+}
+
+/** 设施专用记忆策略占位（§5.5）：数字聚合替代自省，权重对使用规律更稳定。 */
+export interface FacilityMemoryPolicy {
+  shortTermWindow: number;
+  longTermConsolidation: Record<string, unknown>;
+  decay: Record<string, unknown>;
+}
+
+export interface FacilitySpec {
+  specVersion: SpecVersion;
+  facilityId: string;
+  facilityType: string;                      // "classroom" | "library" | ...
+  displayName: string;
+  promptVersion: string;
+  systemPrompt: string;                      // 由 facility.yaml + constraints.yaml 编译 + ABOUT 段
+  lazySections: FacilityLazySection[];
+  domainTools: Array<"facility_query" | "facility_report" | "facility_enforce" | "facility_record">;
+  constraints: CompiledConstraint[];
+  protocol: FacilityProtocol;
+  mesh: AgentSpecMeshProjection;             // initiate 恒 []，defaultGrade 恒 "steer"（§4.3）
+  stateSchema: FacilityStateSchema;
+  modelConfig: ModelConfig;
+  initialState: FacilityInitialState;
+  memoryPolicy: FacilityMemoryPolicy;
+}
+
+/** compileFacility 的上下文（§5.5 恒定签名）。 */
+export interface FacilityCompileContext {
+  facilityId: string;
   modelConfig: ModelConfig;
   compilerVersion: string;
 }

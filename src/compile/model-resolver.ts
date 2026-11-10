@@ -19,6 +19,7 @@
 import type {
   ModelConfig,
   ModelConfigLayer,
+  ModelConfigOverride,
   ModelConfigSource,
   ModelDialogueConfig,
 } from "./types.js";
@@ -170,4 +171,33 @@ export function resolveModelConfig(input: ModelResolveInput): {
   }
 
   return { modelConfig, source };
+}
+
+/**
+ * 运行期宿主覆盖（R06 `setModelConfig`）：在**已定稿**的 ModelConfig + ModelConfigSource
+ * 之上合并一次 patch，被覆盖叶子记 `runtime_override`。独立于 create 的五层解析，也不碰
+ * respec/身份（E09：setModelConfig 独立于 respec）。不 mutate 入参（deep clone）。
+ * reflection 的 source 键沿用最终形 `reflection.<leaf>`（与 resolveModelConfig 出口一致）。
+ */
+export function applyRuntimeModelOverride(
+  current: ModelConfig,
+  source: ModelConfigSource,
+  patch: ModelConfigOverride,
+): { modelConfig: ModelConfig; source: ModelConfigSource } {
+  const modelConfig = structuredClone(current) as ModelConfig;
+  const nextSource: ModelConfigSource = { ...source };
+
+  if (patch.dialogue !== undefined) {
+    mergePatch(modelConfig.dialogue as unknown as Record<string, unknown>, patch.dialogue, "runtime_override", "dialogue", nextSource);
+  }
+  if (patch.budget !== undefined) {
+    mergePatch(modelConfig.budget as unknown as Record<string, unknown>, patch.budget, "runtime_override", "budget", nextSource);
+  }
+  if (patch.reflection !== undefined) {
+    const refl = (modelConfig.reflection ?? {}) as unknown as Record<string, unknown>;
+    mergePatch(refl, patch.reflection, "runtime_override", "reflection", nextSource);
+    modelConfig.reflection = refl as unknown as ModelConfig["reflection"];
+  }
+
+  return { modelConfig, source: nextSource };
 }

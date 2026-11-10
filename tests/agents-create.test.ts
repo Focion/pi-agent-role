@@ -13,8 +13,12 @@ import { join } from "node:path";
 import Database from "better-sqlite3";
 import { describe, expect, it } from "vitest";
 
-import { createRuntime } from "../src/index.js";
+import { createRuntimeInternals } from "../src/runtime/runtime.js";
 import { stringifyYaml } from "../src/compile/yaml.js";
+import { openRoleDb } from "../src/db/db.js";
+import { KnowledgeDao } from "../src/knowledge/dao.js";
+import { KnowledgeService } from "../src/knowledge/service.js";
+import { makeAgentApi } from "../src/runtime/agents.js";
 import type { RuntimeInternals } from "../src/runtime/runtime.js";
 
 /** 写一个最小身份蓝本（6 个冷启动文件齐整，满足 §5.1 严格校验）。 */
@@ -44,7 +48,7 @@ describe("P1 agents.create() (§4.2)", () => {
     const root = mkdtempSync(join(tmpdir(), "pi-role-create-"));
     writeBlueprint(join(root, "templates", "student"));
 
-    const rt = (await createRuntime({
+    const rt = (await createRuntimeInternals({
       root,
       db: join(root, "role-agent.db"),
       devMode: true,
@@ -100,7 +104,7 @@ describe("P1 agents.create() (§4.2)", () => {
 
   it("蓝本不存在 → BlueprintNotFound", async () => {
     const root = mkdtempSync(join(tmpdir(), "pi-role-bp404-"));
-    const rt = (await createRuntime({
+    const rt = (await createRuntimeInternals({
       root,
       db: join(root, "role-agent.db"),
       devMode: true,
@@ -118,7 +122,7 @@ describe("P1 agents.create() (§4.2)", () => {
   it("reconcileRegistrations：前向恢复 status='registering' 的行（§4.2.4）", async () => {
     const root = mkdtempSync(join(tmpdir(), "pi-role-recon-"));
     const dbPath = join(root, "role-agent.db");
-    const rt = (await createRuntime({
+    const rt = (await createRuntimeInternals({
       root,
       db: dbPath,
       devMode: true,
@@ -172,6 +176,139 @@ describe("P1 agents.create() (§4.2)", () => {
       expect(again).toHaveLength(0);
     } finally {
       await rt.close();
+    }
+  });
+
+  it("A05：create 第 7 步失败时投影已先行落库，reconcile 靠完整意图前向补齐（不删行重建）", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pi-role-a05-"));
+    writeBlueprint(join(root, "templates", "student"));
+
+    const roleDb = openRoleDb(join(root, "role-agent.db"));
+    const knowledge = new KnowledgeService({
+      dao: new KnowledgeDao(roleDb.db, { nowReal: () => new Date().toISOString() }),
+      knownAgents: () => new Set<string>(),
+    });
+
+    let meshDown = true;
+    const api = makeAgentApi({
+      root,
+      roleDb: roleDb.db,
+      knowledge,
+      pairingId: "p-test-agents-create",
+      onModelConfigUpdated: () => {},
+      registerProjection: async () => {
+        if (meshDown) throw new Error("mesh register down");
+        return { accountId: "ag-stu-a05", endpointId: "ep-mesh-1" };
+      },
+      registerReflect: async () => ({
+        reflectAccountId: "ag-stu-a05:reflect",
+        reflectEndpointId: "ep-mesh-r1",
+        reflectConversationId: "conv-mesh-r1",
+      }),
+    });
+
+    try {
+      // 第 7 步（注册 dialogue Account）失败：create 抛错，但 DB 已落 registering 行。
+      await expect(api.create({ blueprint: "templates/student", agentId: "ag-stu-a05" })).rejects.toThrow(
+        /mesh register down/,
+      );
+
+      const row = roleDb.db
+        .prepare("SELECT status, registered_projection FROM agents WHERE agent_id = ?")
+        .get("ag-stu-a05") as { status: string; registered_projection: string } | undefined;
+      expect(row?.status).toBe("registering");
+      // A05 核心：注册意图（完整投影）先于注册落库，而不是注册成功后才回写。
+      expect(row?.registered_projection).toBeTruthy();
+      const proj = JSON.parse(row!.registered_projection) as Record<string, unknown>;
+      expect(proj.displayName).toBe("刘明涛");
+      expect(proj.initiate).toContain("chat");
+
+      // create 重试撞 ID（幂等/独占）——恢复通道是 reconcile，不靠删角色行重建。
+      await expect(api.create({ blueprint: "templates/student", agentId: "ag-stu-a05" })).rejects.toThrow(
+        /already exists/,
+      );
+
+      // mesh 恢复后 reconcile 凭落库投影补齐，转正 active。
+      meshDown = false;
+      const out = await api.reconcileRegistrations({ agentIds: ["ag-stu-a05"] });
+      expect(out).toHaveLength(1);
+      expect(out[0]!.before).toBe("registering");
+      expect(out[0]!.after).toBe("active");
+
+      const after = roleDb.db
+        .prepare("SELECT status, mesh_account_id, mesh_reflect_account_id FROM agents WHERE agent_id = ?")
+        .get("ag-stu-a05") as {
+        status: string;
+        mesh_account_id: string;
+        mesh_reflect_account_id: string;
+      };
+      expect(after.status).toBe("active");
+      expect(after.mesh_account_id).toBe("ag-stu-a05");
+      expect(after.mesh_reflect_account_id).toBe("ag-stu-a05:reflect");
+    } finally {
+      roleDb.close();
+    }
+  });
+
+  it("R04 createBatch：逐项串行、单行失败不中断后续，成功/待恢复/已回滚分别报告", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pi-role-batch-"));
+    writeBlueprint(join(root, "templates", "student"));
+
+    const roleDb = openRoleDb(join(root, "role-agent.db"));
+    const knowledge = new KnowledgeService({
+      dao: new KnowledgeDao(roleDb.db, { nowReal: () => new Date().toISOString() }),
+      knownAgents: () => new Set<string>(),
+    });
+
+    // 仅 "ag-2" 的 dialogue 注册区间宕机 → 该项应判 registering（待 reconcile），其余不受影响。
+    let ag2Up = false;
+    const api = makeAgentApi({
+      root,
+      roleDb: roleDb.db,
+      knowledge,
+      pairingId: "p-test-agents-batch",
+      onModelConfigUpdated: () => {},
+      registerProjection: async (input: { agentId: string }) => {
+        if (input.agentId === "ag-2" && !ag2Up) throw new Error("mesh register down");
+        return { accountId: input.agentId, endpointId: `ep-${input.agentId}` };
+      },
+      registerReflect: async (input: { agentId: string }) => ({
+        reflectAccountId: `${input.agentId}:reflect`,
+        reflectEndpointId: `ep-${input.agentId}-reflect`,
+        reflectConversationId: `conv-${input.agentId}-reflect`,
+      }),
+    });
+
+    try {
+      const out = await api.createBatch([
+        { blueprint: "templates/student", agentId: "ag-1" },
+        { blueprint: "templates/student", agentId: "ag-2" },
+        { blueprint: "templates/ghost", agentId: "ag-3" }, // 物化失败 → 已回滚无行
+      ]);
+
+      expect(out.map((o) => o.agentId)).toEqual(["ag-1", "ag-2", "ag-3"]);
+      expect(out.map((o) => o.after)).toEqual(["active", "registering", "failed"]);
+
+      // 第 1 项完整注册。
+      expect(out[0]!.result?.mesh.accountId).toBe("ag-1");
+      expect(out[0]!.result?.mesh.reflectAccountId).toBe("ag-1:reflect");
+      // 第 2 项 mesh 注册失败但行保留，待 reconcile。
+      expect(out[1]!.error?.message).toContain("mesh register down");
+      // 第 3 项物化失败（蓝本不存在）。
+      expect(out[2]!.error?.message).toContain("blueprint not found");
+
+      const statusOf = (id: string) =>
+        (roleDb.db.prepare("SELECT status FROM agents WHERE agent_id = ?").get(id) as { status: string } | undefined)?.status;
+      expect(statusOf("ag-1")).toBe("active");
+      expect(statusOf("ag-2")).toBe("registering");
+      expect(statusOf("ag-3")).toBeUndefined(); // 第 3 项已回滚，无残留行
+
+      // ag-2 的 registering 行可经 reconcile 前向恢复（mesh 恢复后）。
+      ag2Up = true;
+      const rec = await api.reconcileRegistrations({ agentIds: ["ag-2"] });
+      expect(rec[0]!.after).toBe("active");
+    } finally {
+      roleDb.close();
     }
   });
 });

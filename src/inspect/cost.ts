@@ -11,11 +11,10 @@
 // 本文件不 import @pi/agent-mesh，也不含 mesh_ 表名 SQL（R1/R2）。
 // ═══════════════════════════════════════════════════════════════════════════
 
-import { existsSync } from "node:fs";
-
 import type Database from "better-sqlite3";
 
 import { meshCostGroups } from "../mesh/cost-lookup.js";
+import { evaluatePairing } from "../runtime/pairing.js";
 
 /** 排除自省流后的角色成本指标（§20.2.4 roleMetricsExcludingReflect 的返回值）。 */
 export interface RoleCostMetrics {
@@ -45,13 +44,14 @@ const DEFAULT_UNTIL = "9999-12-31T23:59:59.000Z";
 
 /**
  * 两段拼接排除（§20.2.4）。`roleDb` 是 DB-A 连接，`meshDbPath` 是 DB-B 路径。
- * E3（mesh_instance_tag 校验）：当前两侧均未产出实例 tag（列恒 NULL），故按「单 mesh 库
- * 对应单 role 库」处理并把这条写进 caveats；一旦合并多实例映射，这里必须加 tag 过滤。
+ * E3（mesh_instance_tag 校验，R33）：取数前先 `evaluatePairing` 核对双库配对——错库 /
+ * 缺锚点整体抛 PairingError 拒绝出数；无已注册映射（vacant）时安全零值，不把「换了
+ * mesh」按单库假设混过去。
  */
 export function costMetricsExcludingReflect(
   roleDb: Database.Database,
   meshDbPath: string,
-  opts: { since?: string; until?: string } = {},
+  opts: { since?: string; until?: string; agentIds?: string[] } = {},
 ): RoleCostMetrics {
   const since = opts.since ?? DEFAULT_SINCE;
   const until = opts.until ?? DEFAULT_UNTIL;
@@ -59,11 +59,12 @@ export function costMetricsExcludingReflect(
     "verbatim_copies 计在 Renderer 出口（P1/P2/steer 三来源），SQL 只能给 P1 来源的下界",
     "唤醒的闲/忙分支无法由 mesh_deliveries 区分（woke 是布尔）",
     "仅在 mesh 保留期窗口内有效",
-    "mesh_instance_tag 未接线（当前单 mesh 库假设），多实例映射合并后须加 tag 过滤（E3）",
   ];
 
-  // B2 降级：mesh 库不存在 ⇒ 无 mesh 账可核，安全返回零值（不抛）。
-  if (!existsSync(meshDbPath)) {
+  // B2 降级 → R33 收紧：无已注册映射（vacant）时才安全零值（mesh 缺失或首次启动）。
+  // 有映射但缺锚点/错库由 evaluatePairing 抛 PairingError，整体拒绝（E3）。
+  const pairing = evaluatePairing(roleDb, meshDbPath);
+  if (pairing.state === "vacant") {
     return {
       window: { since, until },
       deliveriesTotal: 0,
@@ -101,6 +102,30 @@ export function costMetricsExcludingReflect(
       .map((r) => r.account_id),
   );
 
+  // A36：agentIds 作用域时，把段三的分子分母收紧到这些 Agent 的主/自省账号；
+  // 作用域外账号的投递/消息整行跳过（不是求和后相减）。这是 scope.agentIds 的权威落点。
+  const scopeIds = opts.agentIds?.length ? opts.agentIds : undefined;
+  const scopePrimary = scopeIds
+    ? new Set(
+        roleDb
+          .prepare<unknown[], { account_id: string }>(
+            `SELECT mesh_account_id AS account_id FROM agents WHERE mesh_account_id IS NOT NULL AND agent_id IN (${scopeIds.map(() => "?").join(",")})`,
+          )
+          .all(...scopeIds)
+          .map((r) => r.account_id),
+      )
+    : undefined;
+  const scopeReflect = scopeIds
+    ? new Set(
+        roleDb
+          .prepare<unknown[], { account_id: string }>(
+            `SELECT mesh_reflect_account_id AS account_id FROM agents WHERE mesh_reflect_account_id IS NOT NULL AND agent_id IN (${scopeIds.map(() => "?").join(",")})`,
+          )
+          .all(...scopeIds)
+          .map((r) => r.account_id),
+      )
+    : undefined;
+
   // ── 段三：先过滤再求和（E1）。──
   const unattributed = new Set<string>();
   let deliveriesTotal = 0;
@@ -109,7 +134,13 @@ export function costMetricsExcludingReflect(
   let p1 = 0;
   let excludedReflectDeliveries = 0;
   for (const g of groups.deliveries) {
-    if (reflect.has(g.accountId)) {
+    if (scopePrimary) {
+      if (scopeReflect!.has(g.accountId)) {
+        excludedReflectDeliveries += g.deliveriesTotal;
+        continue;
+      }
+      if (!scopePrimary.has(g.accountId)) continue; // 作用域外
+    } else if (reflect.has(g.accountId)) {
       excludedReflectDeliveries += g.deliveriesTotal;
       continue;
     }
@@ -123,7 +154,13 @@ export function costMetricsExcludingReflect(
   let messagesTotal = 0;
   let excludedReflectMessages = 0;
   for (const m of groups.messages) {
-    if (reflect.has(m.accountId)) {
+    if (scopePrimary) {
+      if (scopeReflect!.has(m.accountId)) {
+        excludedReflectMessages += m.messagesTotal;
+        continue;
+      }
+      if (!scopePrimary.has(m.accountId)) continue; // 作用域外
+    } else if (reflect.has(m.accountId)) {
       excludedReflectMessages += m.messagesTotal;
       continue;
     }

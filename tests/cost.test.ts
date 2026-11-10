@@ -16,6 +16,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import { openRoleDb } from "../src/db/db.js";
 import { costMetricsExcludingReflect } from "../src/inspect/cost.js";
+import { addMeshAnchor, installRolePairing } from "./helpers/pairing.js";
 
 const cleanups: string[] = [];
 function tmpdirTracked(): string {
@@ -46,6 +47,7 @@ describe("P4 成本排除（§20.2.4）", () => {
          VALUES (?, 'role', 'x', ?, 'active', ?, ?, ?)`,
       )
       .run("ag-stu", "0".repeat(64), "2026-01-01T00:00:00.000Z", "acct-stu", "acct-stu:reflect");
+    installRolePairing(roleDb.db); // R33：装配对标识并把 agents.mesh_instance_tag 补成同一标识
 
     // DB-B：最小两表 + 四条投递 + 两条消息（都在核对窗内）。
     const meshDbPath = join(dir, "mesh.db");
@@ -67,6 +69,7 @@ describe("P4 成本排除（§20.2.4）", () => {
     insDel.run("d2", "m-a", "acct-stu:reflect", "steer", 1, "P1"); // 自省流（排除）
     insDel.run("d3", "m-b", "acct-stu:reflect", "followUp", 1, "P1"); // 自省流（排除）
     insDel.run("d4", "m-a", "@system", "silent", 0, "P3"); // 系统账号（未归因，计入 + 列出）
+    addMeshAnchor(mesh); // R33：最小 mesh 替身补锚点账号，配对成立才出数
     mesh.close();
 
     const m = costMetricsExcludingReflect(roleDb.db, meshDbPath, { since: "2026-01-01T00:00:00.000Z", until: "2026-01-02T00:00:00.000Z" });

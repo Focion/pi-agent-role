@@ -59,7 +59,8 @@ export class KnowledgeService {
 
     const existing = this.dao.item(owner, topic);
     const current = existing?.mastery ?? null;
-    const plan = classifyUpdate(current, p.toMastery, kind);
+    // A14：fading 恢复的晋级上限 = 衰减前状态（decay_from 透传进 classifyUpdate）。
+    const plan = classifyUpdate(current, p.toMastery, kind, existing?.decayFrom ?? null);
     if (!plan.ok) {
       this.audit(owner, topic, plan.reason, existing, null, source);
       return { ok: false, reason: plan.reason };
@@ -129,7 +130,21 @@ export class KnowledgeService {
     this.dao.applyChange(change);
     this.audit(owner, topic, null, existing, final.to, source);
 
-    return { ok: true, knId, from: plan.from, to: plan.to, eventIds: events.map((e) => e.evId), practiced: plan.events === "none" };
+    // §17.4.2 纠正流程：误区从 1 → 0 是高价值事件，调用方据此写系统抬高的高显著节情节。
+    const misconceptionCorrected =
+      existing !== undefined && existing.isMisconception === 1 && final.isMisconception === 0
+        ? { topic, corrector: final.taughtBy, wrongBelief: existing.wrongBelief }
+        : undefined;
+
+    return {
+      ok: true,
+      knId,
+      from: plan.from,
+      to: plan.to,
+      eventIds: events.map((e) => e.evId),
+      practiced: plan.events === "none",
+      ...(misconceptionCorrected ? { misconceptionCorrected } : {}),
+    };
   }
 
   // ─── 模板种入（§17.4 来源 1）───────────────────────────────────────────────
@@ -174,7 +189,9 @@ export class KnowledgeService {
    * 返回整理后的队列（去重、按优先级排序、封顶 7）。
    *   · Q4：is_misconception=1 的 topic 自动入队（priority=high，motivation 写系统模糊语，
    *     绝不把 wrong_belief 文本带入——否则误区会自我消解）；
-   *   · Q1：mastery 已达 applied+ 的 topic 出队；
+   *   · A34：继承上一轮队列（模型省略 learningQueue 时，未完成的非误区项不消失）；
+   *   · Q1：mastery 已达 applied+ 且非误区的 topic 出队（A33：仍有误区的 applied/mastered
+   *     项保持 high，不因掌握度高而连带出队）；
    *   · Q3：上限 7，稳定排序后从尾部（low 优先）淘汰；
    *   · Q2：连续 3 个虚拟日未触及 ⇒ 降档——需场景「触及时刻」的虚拟时钟，属 §15.5 日终
    *     任务（尚未搭建），此处不实现（残留）。
@@ -189,6 +206,18 @@ export class KnowledgeService {
     for (const topic of misconceptions) {
       byTopic.set(topic, { topic, priority: "high", motivation: "我好像哪里没搞对" });
     }
+    // A34：继承上一轮队列（优先级较低的「待办」不因本轮模型省略而丢失）。
+    for (const raw of this.dao.lastLearningQueue(owner)) {
+      const topic = (raw?.topic ?? "").trim();
+      if (!topic) continue;
+      const priority: LearningQueueItem["priority"] =
+        raw.priority === "high" || raw.priority === "medium" || raw.priority === "low" ? raw.priority : "medium";
+      const motivation = typeof raw.motivation === "string" ? raw.motivation.slice(0, 200) : "";
+      const cur = byTopic.get(topic);
+      if (!cur || PRIORITY_RANK[priority] > PRIORITY_RANK[cur.priority]) {
+        byTopic.set(topic, { topic, priority, motivation });
+      }
+    }
     // 合并模型提议（同 topic 保留更高优先级；Q4 的 high 优先于模型的 medium/low）。
     for (const raw of proposed) {
       const topic = (raw?.topic ?? "").trim();
@@ -201,10 +230,10 @@ export class KnowledgeService {
         byTopic.set(topic, { topic, priority, motivation });
       }
     }
-    // Q1：已掌握到 applied+ 的自动出队。
+    // Q1：已掌握到 applied+ 且非误区（A33）的自动出队。
     for (const topic of byTopic.keys()) {
       const m = mastery.get(topic);
-      if (m === "applied" || m === "mastered") byTopic.delete(topic);
+      if ((m === "applied" || m === "mastered") && !misconceptions.has(topic)) byTopic.delete(topic);
     }
     // Q3：稳定排序（高优先在前），封顶 7，从尾部淘汰 low。
     return [...byTopic.values()]

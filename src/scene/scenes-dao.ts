@@ -20,6 +20,7 @@ interface SceneDbRow {
   facility_id: string | null;
   facility_json: string | null;
   conversation_id: string | null;
+  host_account_id: string | null;
   floor_mode: string | null;
   conv_bound_at: string | null;
   virtual_start: string | null;
@@ -37,7 +38,7 @@ interface SceneDbRow {
 /** 新建场景的结构化入参；participants 在本层序列化。 */
 export type { NewSceneInput } from "./types.js";
 
-const SELECT_COLS = `scene_id, name, facility_id, facility_json, conversation_id, floor_mode,
+const SELECT_COLS = `scene_id, name, facility_id, facility_json, conversation_id, host_account_id, floor_mode,
   conv_bound_at, virtual_start, virtual_now, participants_json, turn_policy, turn_count,
   token_budget, token_spent, status, created_at, ended_at`;
 
@@ -48,6 +49,7 @@ function mapRow(r: SceneDbRow): SceneRow {
     facilityId: r.facility_id,
     facilityJson: r.facility_json,
     conversationId: r.conversation_id,
+    hostAccountId: r.host_account_id,
     floorMode: r.floor_mode,
     convBoundAt: r.conv_bound_at,
     virtualStart: r.virtual_start,
@@ -88,10 +90,10 @@ export class ScenesDao implements SceneStore {
     );
     this.stmtInsert = db.prepare(
       `INSERT INTO scenes
-         (scene_id, name, facility_id, facility_json, conversation_id, floor_mode, conv_bound_at,
+         (scene_id, name, facility_id, facility_json, conversation_id, host_account_id, floor_mode, conv_bound_at,
           virtual_start, virtual_now, participants_json, turn_policy, turn_count,
           token_budget, token_spent, status, created_at, ended_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, 0, 'active', ?, NULL)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, 0, 'active', ?, NULL)`,
     );
   }
 
@@ -106,6 +108,7 @@ export class ScenesDao implements SceneStore {
       inp.facilityId,
       inp.facilityJson,
       inp.conversationId,
+      inp.hostAccountId ?? null,
       inp.floorMode,
       inp.convBoundAt,
       inp.virtualStart,
@@ -129,17 +132,21 @@ export class ScenesDao implements SceneStore {
   }
 
   /** 推进一轮：写 virtual_now + turn_count + token_spent（单语句原子递增）。 */
-  advance(sceneId: string, virtualNow: string, deltaTokens: number): { turnCount: number; tokenSpent: number } {
-    this.db
+  advance(sceneId: string, virtualNow: string, deltaTokens: number): { turnCount: number; tokenSpent: number; changed: boolean } {
+    // A08：条件推进——只在 status 仍为 active 时更新。并发 close 已标 ended 时 0 行生效，
+    // 编曲器据此停在轮次边界而不发「已关闭场景」后的推进写。
+    const info = this.db
       .prepare(
         `UPDATE scenes SET virtual_now = ?, turn_count = turn_count + 1,
-                            token_spent = token_spent + ? WHERE scene_id = ?`,
+                            token_spent = token_spent + ? WHERE scene_id = ? AND status = 'active'`,
       )
       .run(virtualNow, deltaTokens, sceneId);
     const r = this.db
       .prepare(`SELECT turn_count, token_spent FROM scenes WHERE scene_id = ?`)
       .get(sceneId) as { turn_count: number; token_spent: number } | undefined;
-    return r ? { turnCount: r.turn_count, tokenSpent: r.token_spent } : { turnCount: 0, tokenSpent: 0 };
+    return r
+      ? { turnCount: r.turn_count, tokenSpent: r.token_spent, changed: info.changes > 0 }
+      : { turnCount: 0, tokenSpent: 0, changed: false };
   }
 
   /** 结束/中止：写 status + ended_at。 */
@@ -150,7 +157,7 @@ export class ScenesDao implements SceneStore {
   /** 活跃场景列表（resume 后自检 / 巡检用）。 */
   listActive(): SceneRow[] {
     const rows = this.db
-      .prepare(`${SELECT_COLS} FROM scenes WHERE status = 'active' ORDER BY created_at`)
+      .prepare(`SELECT ${SELECT_COLS} FROM scenes WHERE status = 'active' ORDER BY created_at`)
       .all() as unknown as SceneDbRow[];
     return rows.map(mapRow);
   }

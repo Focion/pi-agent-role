@@ -13,6 +13,9 @@
 
 import type { AccountId, Cap, ConversationId, MeshHost } from "../mesh/public-types.js";
 import type { RoleExt } from "../mesh/ext-role.js";
+import type { UsageBreakdown } from "../mesh/pi-backend.js";
+import type { CostRecord } from "../runtime/types.js";
+import type { SceneExtRegistry } from "./ext-registry.js";
 
 /** 场景状态机（§7.5 四段 + aborted）。DB 缺省 'active' = 运行中。 */
 export type SceneStatus = "active" | "ended" | "aborted";
@@ -42,6 +45,8 @@ export interface SceneRow {
   facilityId: string | null;
   facilityJson: string | null;
   conversationId: string | null;
+  /** cue 发送账号（建档者声明的 hostAccountId，缺省 NULL = 退 deps / @system，§7.3）。 */
+  hostAccountId: string | null;
   floorMode: string | null;
   convBoundAt: string | null;
   virtualStart: string | null;
@@ -68,7 +73,7 @@ export interface SceneSpec {
   conversationId?: ConversationId;
   /** 虚拟起点，形如 W3D1T14（§8.1）。缺省取 root 时钟起点。 */
   virtualStart?: string;
-  /** 每轮推进的虚拟分钟数（§8.2.1 配置）。默认 1。 */
+  /** 每轮推进的虚拟分钟数（§8.2.1 配置，E01 起整分钟）。默认 60（= 1 虚拟小时）。 */
   turnDurationMinutes?: number;
   /** 发言权模式。默认 'director'（只有被点名者能说，§7.2 表）。 */
   floorMode?: FloorMode;
@@ -85,11 +90,36 @@ export interface SceneRunResult {
   sceneId: string;
   stopReason: "max_turns" | "budget" | "aborted" | "closed" | "idle";
   turnsCompleted: number;
-  /** I22：abort 走 beforeClearQueue；该计数应从 mesh 的 queue_cleared 观测为 0。 */
+  /** 本次 run 消耗的 token（不持久；run 临时收窄上限据此判定，R13/E02）。 */
+  tokensThisRun: number;
+  /** 场景累计 token（持久于 scenes.token_spent，跨 run 累加）。 */
+  tokensCumulative: number;
+  /** H04/M04：abort 不再清队列也不回退，此计数恒为 false（moderator 从未触发 queue_cleared）。 */
   queueClearedDetected: boolean;
+  /**
+   * Q01/R16：close 是否已完成「收敛在途 → 解散群会话」的末段。run/resume（非 close 路径）
+   * 恒为 false——只有 close 走解散，abort/预算/轮次熔断都保持会话不解散（场景仍在）。
+   */
+  dissolved: boolean;
+  /**
+   * R16 降级留痕：收敛超时 / 解散失败 / 日终降级等，逐条记录真实原因；空数组 = 无降级。
+   * 绝不把失败吞成成功，也不在未真正解散时宣称 dissolved=true。
+   */
+  degradeTrace: string[];
+  /**
+   * R30/G4 devMode 关场校验：close 在日终后跑一次 A1–A11（含 A2'）分区不变量，
+   * 逐条记录违例（id/assertion/count）；空数组 = 无违例（本次自检全绿）。
+   * run/resume/abort 非 close 路径恒为空数组——只有 close 走关场自检。
+   */
+  invariantViolations: SceneInvariantViolation[];
 }
 
-// ─── 点名 cue（§7.3）───────────────────────────────────────────────────────
+/** R30/G4 devMode 关场校验的一条违例（对应 invariant-sql 的 RoleInvariantReport.violations[]）。 */
+export interface SceneInvariantViolation {
+  id: string;
+  assertion: string;
+  count: number;
+}
 
 /** 点名动作的发起原因（§7.3 领域层 role.cue.reason）。 */
 export type CueReason = "reactive_score" | "round_robin" | "director_script";
@@ -186,6 +216,19 @@ export interface RunOptions {
   tokenBudget?: number;
 }
 
+/**
+ * 日终编排的回调（R16/Q02）。scene 目录不 import reflect，运行时把 DayEndService 的一
+ * 次片段闭包成这个最小形状注入；close 在「收敛在途」之后、「解散」之前调用它。
+ */
+export type DayEndRunner = (opts: {
+  sceneId: string;
+  agentIds: string[];
+  virtualTs: string;
+}) => Promise<{
+  virtualDay: number;
+  ran: Array<{ agentId: string; depth: string; alreadyDone: boolean; degraded: string[] }>;
+}>;
+
 /** scenes.create() 建档成功后的句柄。 */
 export interface SceneEstablished {
   sceneId: string;
@@ -202,7 +245,7 @@ export interface SceneEstablished {
 export interface SceneOrchestrator {
   /** 建档 + 入会（§7.1）：写 scenes 行 → 建/复用 group 会话 → addMember 设 caps。幂等 by sceneId。 */
   create(spec: SceneSpec): Promise<SceneEstablished>;
-  /** 跑一轮（§7.5）：点名 → 等回复 → 推进虚拟时钟 → 预算熔断。abort 走 beforeClearQueue。 */
+  /** 跑一轮（§7.5）：点名 → 发 cue → 推进虚拟时钟 → 预算熔断；abort（H04）只停新 cue。 */
   run(sceneId: string, opts?: RunOptions): Promise<SceneRunResult>;
   /** 恢复一个仍在 active 的场景接着跑（读 scenes 行，不重建会话成员）。 */
   resume(sceneId: string, opts?: RunOptions): Promise<SceneRunResult>;
@@ -221,6 +264,8 @@ export interface NewSceneInput {
   facilityId: string | null;
   facilityJson: string | null;
   conversationId: string | null;
+  /** cue 发送账号；未声明时 build 层落在 NULL（退 deps.host_account_id / @system）。 */
+  hostAccountId?: AccountId | null;
   floorMode: string | null;
   convBoundAt: string | null;
   virtualStart: string | null;
@@ -236,7 +281,7 @@ export interface SceneStore {
   insert(inp: NewSceneInput): void;
   get(sceneId: string): SceneRow | undefined;
   getByConversation(conversationId: ConversationId): SceneRow | undefined;
-  advance(sceneId: string, virtualNow: string, deltaTokens: number): { turnCount: number; tokenSpent: number };
+  advance(sceneId: string, virtualNow: string, deltaTokens: number): { turnCount: number; tokenSpent: number; changed: boolean };
   end(sceneId: string, status: Extract<SceneStatus, "ended" | "aborted">, endedAt: string): void;
   listActive(): SceneRow[];
 }
@@ -248,8 +293,25 @@ export interface SceneOrchestratorDeps {
   floorState: FloorStateController;
   /** 点名（cue）的 from 账号后备；per-scene 真值 = participants 里 role:'host' 者（§7.3）。 */
   hostAccountId?: AccountId;
-  /** accountId → 主 Endpoint（abort 走 beforeClearQueue 时反查被点名者的端点）。 */
-  endpointOf?: (accountId: AccountId) => string | undefined;
+  /** 场景位置账本（A19）：cue 前写被点名者所在场景/轮次/虚拟时间，供 extProvider 读。 */
+  extRegistry?: SceneExtRegistry;
+  /** 本轮实际生成/token 用量（A07，测试/注入缝）：直接给本轮增量，默认 0；缺省无 LLM 语义。 */
+  usageForTurn?: (sceneId: string, addressee: AccountId, turn: number) => number;
+  /**
+   * A07 真实用量回读：返回账号当前累计 usage（跨 run 持久于 durable 会话 pi.usage）。
+   * 编曲器在 drive 起点为每位发言候选读一次基线，之后每轮读一次并与该账号上次基线做差，
+   * 得到本轮增量（input/output/totalTokens 分别做差）。与 usageForTurn 互斥：两者都注入时
+   * usageForTurn 优先（测试缝只给定增量总额，无 input/output 拆分）。
+   */
+  usageTotalFor?: (addressee: AccountId) => UsageBreakdown | Promise<UsageBreakdown>;
+  /** 成本出口（§20.2 三类来源）：每完成一轮真实生成即上抛一条 `source:'dialogue'` 记录。 */
+  onCost?: (c: CostRecord) => void;
+  /** 一轮收敛等待上限（A06，真实毫秒）：等被点名者 consumed 才计发言/推进；默认 30000。 */
+  turnSettledMs?: number;
+  /** 日终编排（R16/Q02）：close 在收敛在途后调用；缺省不跑日终（延迟接线，不伪造）。 */
+  dayEnd?: DayEndRunner;
+  /** R30/G4 devMode 关场校验：close 在日终后调用；缺省不跑自检（生产），返回 A1–A11 违例。 */
+  invariantCheck?: () => SceneInvariantViolation[];
   now?: () => string;
 }
 

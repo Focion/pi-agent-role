@@ -27,7 +27,7 @@ import type { DomainToolHandlers } from "../mesh/tools.js";
 import { newId } from "../runtime/id.js";
 import { parseVirtualTs, virtualHoursOf } from "../runtime/virtual-clock.js";
 import { OBSERVATION_CONFIDENCE, RETRIEVAL_BUDGET, WRITE } from "./constants.js";
-import type { MemoryDao } from "./dao.js";
+import type { EpisodeCandidate, MemoryDao } from "./dao.js";
 import { estimateTokens, renderMemoryBlocks } from "./render.js";
 import {
   makeRankedCardRenderer,
@@ -44,7 +44,7 @@ import {
   type MemoryPath,
   type MemoryTrigger,
 } from "./score.js";
-import type { SubjectRef } from "./subject.js";
+import { parseSubjectRef, type SubjectRef } from "./subject.js";
 import { makeMemoryTools } from "./tools.js";
 import { freshTurnState, type TurnState } from "./turn.js";
 
@@ -69,12 +69,20 @@ function safeVirtualTs(ts: string | undefined): string {
 }
 
 /**
- * 设施事件的观察 gist：优先用 renderHints 的各感官通道片段。理想下应按接收方的
- * narrative_voice.sensory.dominant_channel 挑通道（§16.3.2），但该偏好未进 MemoryPolicy；
- * 这里退化为串接全部通道——同一个客观事件仍由「是否写 + 写什么」两处受策略控制。
+ * 设施事件的观察 gist（§16.3.2）：按接收方 `narrative_voice.sensory.dominant_channel`
+ * 从 renderHints 挑通道——视觉型记「板书很乱」，听觉型记「后排窃窃私语」。未指定通道或该
+ * 通道无片段时退化为串接全部通道；renderHints 全空时退回中性 text。
  */
-function facilityGist(fe: FacilityEventPayload, text: string): string {
+function facilityGist(
+  fe: FacilityEventPayload,
+  text: string,
+  dominantChannel?: "visual" | "auditory" | "tactile" | "olfactory",
+): string {
   const rh = fe.renderHints;
+  if (rh && dominantChannel) {
+    const parts = rh[dominantChannel];
+    if (parts && parts.length > 0) return parts.join("；");
+  }
   if (rh) {
     const parts = [
       ...(rh.visual ?? []),
@@ -94,6 +102,9 @@ export interface MemoryServiceDeps {
   knowledge: KnowledgeService;
   /** 逐账号解析记忆策略（异步：恢复期要重编译 identity）。返回 undefined 用默认策略。 */
   policyOf: (accountId: string) => Promise<MemoryPolicy | undefined>;
+  /** R31 内部健康保护：fail-closed 时（invariant 违反 / accessControl 降级）返回 false，
+   *  记忆写入（情节 / 判定 / 观察）一律停写。缺省恒 true（无健康哨兵）。 */
+  writesAllowed?: () => boolean;
 }
 
 export class MemoryService {
@@ -101,9 +112,13 @@ export class MemoryService {
   private readonly registry: RoleAccountRegistry;
   private readonly knowledge: KnowledgeService;
   private readonly policyOf: (accountId: string) => Promise<MemoryPolicy | undefined>;
+  /** R31 内部健康保护：fail-closed 停写门（缺省放行）。 */
+  private readonly writesAllowed: () => boolean;
 
   /** accountId → 当前活动轮（一个 owner 一轮；message_consumed 结算清除）。 */
   private readonly turns = new Map<string, TurnState>();
+  /** A11：sourceMsgId → 活动轮——同账号多 delivery 时 consumed 按来源消息精确结算，不串来源。 */
+  private readonly turnsByMsg = new Map<string, TurnState>();
   /** accountId → 已解析策略（成分稳定，缓存避免每轮重编译）。 */
   private readonly policyCache = new Map<string, MemoryPolicy>();
   /** owner → 连续「nudge 后仍 written=0」计数（B 模式熔断 §12.4）。 */
@@ -115,6 +130,7 @@ export class MemoryService {
     this.registry = deps.registry;
     this.knowledge = deps.knowledge;
     this.policyOf = deps.policyOf;
+    this.writesAllowed = deps.writesAllowed ?? (() => true);
   }
 
   // ─── 装配 ────────────────────────────────────────────────────────────────
@@ -127,7 +143,8 @@ export class MemoryService {
     mesh.on("message_consumed", (p) => this.handleConsumed(p));
   }
 
-  /** P2 context 钩子：把本轮自动检索的卡片 + 学习队列注入 LLM 上下文（§14.4 / §18.4.4 / §17.5.2）。 */
+  /** P2 context 钩子：把 L2 画像/知识、L1 记忆卡片、瞬时状态 + 学习队列注入 LLM 上下文
+   *  （§14.1.2 / §18.4.4 / §17.5.2；R23 分层预算 L2≤500 / L1≤900 / 瞬时≤150，L2 优先于 L1）。 */
   contextHookFor(accountId: string): ContextHook {
     const self = this;
     return async (event, _ctx) => {
@@ -135,19 +152,51 @@ export class MemoryService {
       if (!turn) return undefined;
       await turn.ready;
       const r = turn.retrieval;
+
+      // ── L2（§14.1.2 / R23）：本人画像 + 知识摘要 + 发送者印象；无 L1 命中也可注入。 ──
+      const selfProfile = self.dao.profileOf(turn.ownerAgent, { type: "self", id: "self" });
+      const knowledgeSummary = self.knowledge.summary(turn.ownerAgent);
+      const senderRec = turn.senderAccountId ? self.registry.byAccountId(turn.senderAccountId) : undefined;
+      const senderRef: SubjectRef | undefined = senderRec
+        ? senderRec.agentType === "facility"
+          ? { type: "facility", id: senderRec.agentId }
+          : { type: "person", id: senderRec.agentId }
+        : undefined;
+      const senderProfile = senderRef ? self.dao.profileOf(turn.ownerAgent, senderRef) : undefined;
+      const l2Card = self.renderL2Card(
+        selfProfile?.impression ?? null,
+        knowledgeSummary,
+        senderRef ? self.labelOf(senderRef) : null,
+        senderProfile?.impression ?? null,
+        RETRIEVAL_BUDGET.l2,
+      );
+
+      // ── 瞬时（§14.1.2 / R23）：实时状态（情绪/精力）+ 学习队列，共享 150 额度。 ──
+      const state = self.dao.currentState(turn.ownerAgent);
+      const stateCard = self.renderStateCard(state, RETRIEVAL_BUDGET.transient);
       const lq = self.knowledge.learningQueue(turn.ownerAgent);
-      const lqCard = self.renderLearningQueue(lq, RETRIEVAL_BUDGET.transient);
+      const lqCard = self.renderLearningQueue(
+        lq,
+        Math.max(0, RETRIEVAL_BUDGET.transient - (stateCard?.tokens ?? 0)),
+      );
 
+      const hasL2 = l2Card !== null;
       const hasMemory = (r?.cards?.length ?? 0) > 0;
-      const hasLq = lqCard !== null;
+      const hasTransient = stateCard !== null || lqCard !== null;
 
-      // 两边都空 → 无注入（no-op，不写 retrieval_log、不返回额外 messages）。
-      if (!hasMemory && !hasLq) return undefined;
+      // 三层皆空 → 无注入（no-op，不写 retrieval_log、不返回额外 messages）。
+      if (!hasL2 && !hasMemory && !hasTransient) return undefined;
+
+      const l2Tokens = l2Card?.tokens ?? 0;
+      const l1Tokens = r?.tokensL1 ?? 0;
+      const transientTokens = (stateCard?.tokens ?? 0) + (lqCard?.tokens ?? 0);
 
       // 幂等（§18.4.4 上下文钩子每个 LLM 调用都会重跑）：同一 trigger_msg 只落一次
       // retrieval_log + 强化一次。hasRetrievalFor 是这个副作用的守门。
       if (turn.sourceMsgId && !self.dao.hasRetrievalFor(turn.ownerAgent, turn.sourceMsgId)) {
-        const combinedText = [r?.cardsText ?? "", lqCard?.text ?? ""].filter(Boolean).join("\n\n");
+        const combinedText = [l2Card?.text ?? "", r?.cardsText ?? "", stateCard?.text ?? "", lqCard?.text ?? ""]
+          .filter(Boolean)
+          .join("\n\n");
         self.dao.insertRetrievalLog({
           ownerAgent: turn.ownerAgent,
           sceneId: turn.sceneId,
@@ -156,10 +205,10 @@ export class MemoryService {
           queryJson: r?.queryJson ?? "{}",
           candidates: r?.candidateCount ?? 0,
           selectedJson: r?.selectedJson ?? "[]",
-          tokensL2: 0,
-          tokensL1: r?.tokensL1 ?? 0,
-          tokensTransient: lqCard?.tokens ?? 0,
-          tokensTotal: (r?.tokensL1 ?? 0) + (lqCard?.tokens ?? 0),
+          tokensL2: l2Tokens,
+          tokensL1: l1Tokens,
+          tokensTransient: transientTokens,
+          tokensTotal: l2Tokens + l1Tokens + transientTokens,
           clamped: r?.clamped ?? 0,
           renderedCard: combinedText,
           cardSha256: sha256Hex(combinedText ?? ""),
@@ -169,9 +218,11 @@ export class MemoryService {
         }
       }
 
-      // R3（§10.3）：只追加、不整体替换。
+      // R3（§10.3）：只追加、不整体替换。次序 L2 → L1 → 瞬时（§14.1.2 L2 优先于 L1）。
       const msgs = [...((event.messages as unknown[]) ?? [])];
+      if (l2Card) msgs.push(self.l2ContextCard(l2Card.text));
       if (hasMemory) msgs.push(self.memoryCard(r!.cardsText));
+      if (stateCard) msgs.push(self.transientCard(stateCard.text));
       if (lqCard) msgs.push(self.transientCard(lqCard.text));
 
       return { messages: msgs };
@@ -190,6 +241,8 @@ export class MemoryService {
       // 每次装配取实时快照（新建 Agent 后仍能通过 N2 已知 person 校验，不落在构造期旧快照）。
       knownAgents: new Set(this.registry.allAgentIds()),
       labelOf: (ref) => this.labelOf(ref),
+      // R31：fail-closed 时 remember / note_self 拒写（健康哨兵与事件处理共用同一门）。
+      writesAllowed: () => this.writesAllowed(),
     });
   }
 
@@ -279,25 +332,88 @@ export class MemoryService {
     return { text, tokens: budgetTokens - budget };
   }
 
-  /** 瞬时上下文块的 mesh 注入形态（customType: "transient" ↔ §14.3.1 三种 ContextBlock kind）。 */
+  /**
+   * 瞬时上下文块的注入形态。M02：durable 端 pi-ai `Message` 只认 `role:"user"|"assistant"|"system"`
+   * + 字符串 content，故记忆/学习队列卡片按 `UserMessage = {role:"user", content, timestamp}` 注入，
+   * 不再用旧 coding-agent 的 `{role:"custom", content:[{type:"text"}]}` 形状（afterGeneration 钩子注入）。
+   */
   private transientCard(text: string): unknown {
-    return {
-      role: "custom",
-      customType: "transient",
-      content: [{ type: "text", text }],
-      display: false,
-      timestamp: Date.now(),
-    };
+    return { role: "user", content: text, timestamp: Date.now() };
   }
 
   private memoryCard(cardsText: string): unknown {
-    return {
-      role: "custom",
-      customType: "memory",
-      content: [{ type: "text", text: cardsText }],
-      display: false,
-      timestamp: Date.now(),
+    return { role: "user", content: cardsText, timestamp: Date.now() };
+  }
+
+  /**
+   * R23 L2 卡（§14.1.2 ≤500）：本人自我印象 + 知识摘要 + 发送者印象。印象短句优先；
+   * 知识摘要逐行加入、超出硬上限即停（可截断，§14.1.2 dropped 不虚扣）。全部为空返回 null。
+   */
+  private renderL2Card(
+    selfImpression: string | null,
+    knowledge: string,
+    senderLabel: string | null,
+    senderImpression: string | null,
+    budgetTokens: number,
+  ): { text: string; tokens: number } | null {
+    const header = "<<<SELF\n[我的画像与知识]\n";
+    const close = "SELF>>>";
+    let budget = budgetTokens - estimateTokens(header) - estimateTokens(close);
+    if (budget <= 0) return null;
+
+    const lines: string[] = [];
+    let any = false;
+    const push = (line: string): boolean => {
+      const cost = estimateTokens(line + "\n");
+      if (cost > budget) return false;
+      lines.push(line);
+      budget -= cost;
+      return true;
     };
+    const clean = (s: string | null): string | null => (s && s.trim().length > 0 ? s.trim() : null);
+
+    const selfClean = clean(selfImpression);
+    if (selfClean && push(`- 自我印象：${selfClean}`)) any = true;
+
+    const senderClean = clean(senderImpression);
+    if (senderLabel && senderClean && push(`- 对${senderLabel}的印象：${senderClean}`)) any = true;
+
+    const knowledgeLines = knowledge.split("\n").map((s) => s.trim()).filter(Boolean);
+    for (const k of knowledgeLines) {
+      if (push(`- ${k}`)) any = true;
+    }
+
+    if (!any) return null;
+    const text = `${header}${lines.join("\n")}\n${close}`;
+    return { text, tokens: budgetTokens - budget };
+  }
+
+  /** R23 L2 画像/知识卡片的注入形态（与 memoryCard/transientCard 同构的 UserMessage）。 */
+  private l2ContextCard(text: string): unknown {
+    return { role: "user", content: text, timestamp: Date.now() };
+  }
+
+  /**
+   * R23 实时状态卡（§14.1.2 瞬时档）：情绪 + 精力。默认状态（中性 / 0.5 / 0.5）不注入，
+   * 避免每轮噪音——只在自省 stateAdjust 改变状态后才进上下文。超瞬时额度宁可省略。
+   */
+  private renderStateCard(
+    state: { mood: string; moodIntensity: number; energy: number },
+    budgetTokens: number,
+  ): { text: string; tokens: number } | null {
+    const isDefault =
+      state.mood === "中性" && state.moodIntensity === 0.5 && state.energy === 0.5;
+    if (isDefault) return null;
+    const text = [
+      "<<<STATE",
+      "[当前状态]",
+      `- 情绪：${state.mood}（强度 ${state.moodIntensity.toFixed(2)}）`,
+      `- 精力：${state.energy.toFixed(2)}`,
+      "STATE>>>",
+    ].join("\n");
+    const tokens = estimateTokens(text);
+    if (tokens > budgetTokens) return null; // 固定字段不该超，超了宁可省略
+    return { text, tokens };
   }
 
   // ─── 事件处理 ────────────────────────────────────────────────────────────
@@ -308,6 +424,8 @@ export class MemoryService {
     if (!rec || rec.agentType !== "role") return; // 设施/系统无情节记忆
     // 发给自身 reflect 流的提示不构成记忆（§12.5 边界 2）。
     if (rec.reflectAccountId && envelope.to?.length === 1 && envelope.to[0] === rec.reflectAccountId) return;
+    // R31：fail-closed 时停写（发送方自我记忆的判定行也是记忆写入）。
+    if (!this.writesAllowed()) return;
     void this.rememberSender(envelope, rec.agentId);
   }
 
@@ -317,16 +435,21 @@ export class MemoryService {
     if (!rec || rec.agentType !== "role") return;
     const re = roleExtOf(p.envelope);
 
+    // P3（静默档）零对话情节：先于任何观察写入判定资格（§16.3 / R21）。
+    if (p.path === "P3") return;
+
     // 设施事件观察：ambient event（expect:none）不会唤醒角色，但仍在 delivered 侧落 observation。
     if (p.envelope.kind === "event" && re.facilityEvent) {
-      void this.observeFacility(p.accountId, rec.agentId, p.envelope, re.facilityEvent);
+      // R31：fail-closed 时观察也不落库（观察是记忆写入）。
+      if (this.writesAllowed()) void this.observeFacility(p.accountId, rec.agentId, p.envelope, re.facilityEvent);
     }
 
-    if (!p.woke || p.path === "P3") return;
+    if (!p.woke) return;
     const virtualTs = safeVirtualTs(re.virtualTs);
     const turn = freshTurnState({
       accountId: p.accountId,
       ownerAgent: rec.agentId,
+      senderAccountId: p.envelope.from,
       policy: defaultMemoryPolicy(),
       path: p.path,
       virtualTs,
@@ -338,14 +461,18 @@ export class MemoryService {
     });
     turn.ready = this.initializeTurn(turn, p.envelope);
     this.turns.set(p.accountId, turn);
+    this.turnsByMsg.set(p.envelope.id, turn);
   }
 
   /** 轮终结算（§12.4）：落 memory_decisions + B 模式兜底 nudge；partial（abort）不结算。 */
   private handleConsumed(p: MeshEvents["message_consumed"]): void {
     if (p.partial) return;
-    const turn = this.turns.get(p.accountId);
+    // A11：按来源消息 id 结算，而非 accountId——同账号 D1/D2 乱序消费不串来源、不删错轮。
+    const turn = this.turnsByMsg.get(p.envelope.id);
     if (!turn) return;
-    this.turns.delete(p.accountId);
+    this.turnsByMsg.delete(p.envelope.id);
+    // 只有当该消息仍是「当前活动轮」时才清掉 accountId 入口，避免误删更新的轮。
+    if (this.turns.get(p.accountId) === turn) this.turns.delete(p.accountId);
     void this.finalizeTurn(turn, p.envelope);
   }
 
@@ -358,9 +485,14 @@ export class MemoryService {
 
       const trigger = this.memoryTrigger(envelope, turn.accountId, turn.path);
       const senderRef = this.subjectRefOfAccount(envelope.from);
+      // R22：发送方角色取 agents.role（真实角色名），不用 agentType（"role"/"facility"）
+      // 充当社会角色——authorityWeights 的键是角色名（teacher/student…），agentType 命中不了。
+      const senderRec = this.registry.byAccountId(envelope.from);
       turn.score = scoreMemorability(trigger, policy, {
         currentAccountId: turn.accountId,
-        senderRole: this.registry.byAccountId(envelope.from)?.agentType ?? "other",
+        senderRole: senderRec
+          ? (this.dao.roleOfAgent(senderRec.agentId) ?? senderRec.agentType)
+          : "other",
         trustOfSender: senderRef
           ? (this.dao.profileOf(turn.ownerAgent, senderRef)?.trust ?? policy.defaultTrust)
           : policy.defaultTrust,
@@ -371,7 +503,25 @@ export class MemoryService {
       this.dao.decaySweep(turn.ownerAgent, turn.virtualHours, policy);
 
       const text = envelopeText(envelope);
-      const candidates = this.dao.searchCandidates(turn.ownerAgent, text, false);
+      const ftsCandidates = this.dao.searchCandidates(turn.ownerAgent, text, false);
+      // A29：主体候选补充——整条自然语言进 FTS 被当精确短语时，措辞不同的旧 gist 无候选；
+      // 在场主体在 episode_subjects 里可反查，把「同一人物/场所」的情节捞回候选面。
+      // self 是 owner 自聚焦兜底、范围过宽，DAO 内部已排除。
+      const subjectRefs = [...turn.presentSubjects]
+        .map((k) => {
+          try {
+            return parseSubjectRef(k);
+          } catch {
+            return undefined;
+          }
+        })
+        .filter((s): s is SubjectRef => s !== undefined && s.type !== "self");
+      const subjectCandidates = this.dao.searchCandidatesBySubjects(turn.ownerAgent, subjectRefs, false);
+      // 合并去重：FTS 候选优先保留其 bm25 相关性；同 id 的主体候选只在 FTS 缺席时补位。
+      const merged = new Map<string, EpisodeCandidate>();
+      for (const c of ftsCandidates) merged.set(c.episodeId, c);
+      for (const c of subjectCandidates) if (!merged.has(c.episodeId)) merged.set(c.episodeId, c);
+      const candidates = [...merged.values()];
       if (candidates.length > 0) {
         const subjectsByEpisode = this.dao.subjectsOf(
           turn.ownerAgent,
@@ -414,6 +564,8 @@ export class MemoryService {
     await turn.ready;
     const owner = turn.ownerAgent;
     const sourceMsgId = turn.sourceMsgId ?? envelope.id;
+    // R31：fail-closed 时停写判定行（B 模式兜底 nudge 一并跳过，不追写）。
+    if (!this.writesAllowed()) return;
     const written = this.dao.hasEpisodeFor(owner, sourceMsgId);
     this.dao.insertDecision({
       ownerAgent: owner,
@@ -446,10 +598,16 @@ export class MemoryService {
     const target = pending[0];
     if (!target) return;
     this.nudgeFailures.set(owner, failed + 1);
-    void this.mesh
-      .nudge(rec.endpointId, NUDGE_TEXT, { deliverAs: "followUp", triggerTurn: false })
-      .then(() => this.dao.markNudged(owner, target.sourceMsgId))
-      .catch(() => {});
+    try {
+      // H04/R16 teardown 竞态：close 后迟到的 turn_end 仍可能走到这里，mesh 已关时 nudge
+      // 的 assertOpen 会**同步**抛出（不会被下方的 .catch 接住），故先包一层同步 try。
+      void this.mesh
+        .nudge(rec.endpointId, NUDGE_TEXT, { deliverAs: "followUp", triggerTurn: false })
+        .then(() => this.dao.markNudged(owner, target.sourceMsgId))
+        .catch(() => {});
+    } catch {
+      // mesh 已关闭：best-effort 追问无从投递，静默丢弃（B 模式兜底本就是可丢失路径）。
+    }
   }
 
   private async rememberSender(envelope: Envelope, owner: string): Promise<void> {
@@ -488,7 +646,7 @@ export class MemoryService {
       const policy = await this.policyFor(accountId);
       const re = roleExtOf(envelope);
       const text = envelopeText(envelope);
-      const gist = facilityGist(fe, text);
+      const gist = facilityGist(fe, text, policy.dominantChannel);
       if (!gist) return;
       const recent = this.dao.recentGists(owner, WRITE.recentGistLimit);
       const novelty = fe.anomalous ? 1 : 1 - maxSimilarity(gist, recent);

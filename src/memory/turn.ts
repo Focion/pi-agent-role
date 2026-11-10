@@ -38,6 +38,8 @@ export interface TurnState {
   accountId: string;
   /** 分区键 = agentId。 */
   ownerAgent: string;
+  /** 本轮触发消息的发送方 accountId（R23 L2 发送者印象：owner 对该主体的画像）。 */
+  senderAccountId?: string;
   policy: MemoryPolicy;
   /** 当前进上下文路径（决定 remember 的 confidence 与打分折扣）。 */
   path: "P1" | "P2" | "P3";
@@ -64,6 +66,7 @@ export interface TurnState {
 export interface TurnStateInit {
   accountId: string;
   ownerAgent: string;
+  senderAccountId?: string;
   policy: MemoryPolicy;
   path: "P1" | "P2" | "P3";
   virtualTs: string;
@@ -78,6 +81,7 @@ export function freshTurnState(init: TurnStateInit): TurnState {
   return {
     accountId: init.accountId,
     ownerAgent: init.ownerAgent,
+    senderAccountId: init.senderAccountId,
     policy: init.policy,
     path: init.path,
     virtualTs: init.virtualTs,

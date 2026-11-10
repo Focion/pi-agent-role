@@ -14,7 +14,8 @@
 // 后端（backend）缺省为 fake（无 LLM），供测试与 P0 冒烟；P1 接 pi SDK。
 // ═══════════════════════════════════════════════════════════════════════════
 
-import type { Account, Endpoint, MeshToolName, SessionFactory, ToolDefinition } from "@pi/agent-mesh/core";
+import { REJECT_CODES } from "@pi/agent-mesh/core";
+import type { Account, Endpoint, MeshToolName, MeshToolResult, SessionFactory, ToolDefinition } from "@pi/agent-mesh/core";
 
 import { spreadRoleExt, decodeRoleExt, type RoleExt } from "./ext-role.js";
 import { BUILTIN_WHITELIST, domainToolsFor, type AccountKind, type DomainToolHandlers } from "./tools.js";
@@ -24,12 +25,12 @@ export interface RoleSessionFactoryContext {
   endpoint: Endpoint;
   account: Account;
   tools: ToolDefinition[];
-  piSessionId?: string;
+  runtimeRef?: string;
 }
 
 /** 真实 pi 会话后端（P1 用 mesh 的 createPiSessionFactory 实现）；P0 用 fake。 */
 export interface SessionBackend {
-  create(ctx: RoleSessionFactoryContext & { tools: ToolDefinition[] }): Promise<{ session: unknown; piSessionId: string }>;
+  create(ctx: RoleSessionFactoryContext & { tools: ToolDefinition[] }): Promise<{ session: unknown; runtimeRef: string }>;
   open(ctx: RoleSessionFactoryContext & { tools: ToolDefinition[] }): Promise<{ session: unknown }>;
   dispose?(ctx: { endpoint: Endpoint; session: unknown }): Promise<void>;
 }
@@ -45,6 +46,29 @@ export interface RoleSessionFactoryOptions {
   domainHandlers?: DomainToolHandlers;
   /** 逐账号领域工具处理器（P3 记忆：remember/recall 需按 owner 分区闭包；异步装配）。 */
   domainHandlersFor?: (accountId: string) => Promise<DomainToolHandlers> | DomainToolHandlers;
+  /**
+   * 边界审计（R11 / §18.4.4）：mesh_send 被 mesh 以附录 D reject 十项之一拒绝时回调一次。
+   * 由 runtime 装配闭包把该拒绝写成一条 boundary_events（设施非法主动发起 → 拒绝 + 恰一条
+   * 审计，与 R31 共用一套 owner/拒绝设计）。缺省不审计。
+   */
+  boundaryAudit?: (e: BoundaryReject) => void | Promise<void>;
+}
+
+/** mesh_send 拒绝事件（附录 D 十项之一）。装饰器从工具结果里提取，绝不把本环工具错误误判为拒绝。 */
+export interface BoundaryReject {
+  /** 被拒 mesh_send 的发起账号（accountId）。 */
+  accountId: string;
+  /** 附录 D 十项拒绝码（∈ REJECT_CODES），不含工具层错误码。 */
+  reasonCode: string;
+  /** 拒绝附带消息（detail_json 用）。 */
+  message: string;
+  /** 本次工具调用 id（客户的 tool_call id）。 */
+  toolCallId: string;
+  /** 场景位置（ext.role 已补齐的字段，可空）。 */
+  sceneId?: string;
+  virtualTs?: string;
+  /** 尝试发送的 kind（mesh_send.params.kind，可空）。 */
+  attemptedKind?: string;
 }
 
 /**
@@ -78,7 +102,7 @@ export type BeforeCompactHook = (event: SessionBeforeCompactEvent) => Promise<vo
 function fakeBackend(): SessionBackend {
   return {
     async create(ctx) {
-      return { session: { accountId: ctx.account.id }, piSessionId: `fake-${ctx.account.id}-${uuid()}` };
+      return { session: { accountId: ctx.account.id }, runtimeRef: `fake-${ctx.account.id}-${uuid()}` };
     },
     async open(ctx) {
       return { session: { accountId: ctx.account.id } };
@@ -87,19 +111,71 @@ function fakeBackend(): SessionBackend {
   };
 }
 
-/** §3.6 写法②：包 mesh_send 的 execute，在 handler 前补齐三个 ext.role 字段。 */
-function decorateMeshSend(tool: ToolDefinition, extProvider: (accountId: string) => RoleExt): ToolDefinition {
+/** 提取工具结果里的拒绝码（只认附录 D 十项；工具层错误码/正常 JSON 一律不算）。 */
+function rejectCodeOf(result: MeshToolResult): { code: string; message: string } | undefined {
+  const candidates: string[] = [];
+  const content = (result as MeshToolResult | undefined)?.content;
+  if (typeof content === "string") {
+    candidates.push(content);
+  } else if (Array.isArray(content)) {
+    for (const block of content) {
+      const text = (block as { text?: unknown } | undefined)?.text;
+      if (typeof text === "string") candidates.push(text);
+    }
+  }
+  for (const c of candidates) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(c);
+    } catch {
+      continue;
+    }
+    const code = (parsed as { error?: { code?: unknown } } | null)?.error?.code;
+    if (typeof code === "string" && (REJECT_CODES as readonly string[]).includes(code)) {
+      const message = (parsed as { error?: { message?: unknown } }).error?.message;
+      return { code, message: typeof message === "string" ? message : "" };
+    }
+  }
+  return undefined;
+}
+
+/** §3.6 写法②：包 mesh_send 的 execute，在 handler 前补齐三个 ext.role 字段；若该发送被
+ *  mesh 以拒十项之一拒绝，再从结果里抽出拒绝码触发一次边界审计（R11，§18.4.4）。
+ *  导出于测试：与 makeBoundaryAudit 组合即可对真实 mesh_send 验证「拒绝 → 恰一条审计」。 */
+export function decorateMeshSend(
+  tool: ToolDefinition,
+  accountId: string,
+  extProvider: (accountId: string) => RoleExt,
+  boundaryAudit?: (e: BoundaryReject) => void | Promise<void>,
+): ToolDefinition {
   if (tool.name !== "mesh_send") return tool;
   const orig = tool.execute;
   return {
     ...tool,
     execute: async (toolCallId, params, signal, onUpdate, ctx) => {
-      const pre = extProvider("") ?? {};
+      // A19：用会话的真实 accountId（不是空串），否则 extProvider 拿不到账号、退默认起点。
+      const pre = extProvider(accountId) ?? {};
       const existing = decodeRoleExt((params as { ext?: unknown } | undefined)?.ext);
       const merged = spreadRoleExt(existing, pre);
       const next: Record<string, unknown> =
         params && typeof params === "object" ? { ...params, ext: merged } : { ext: merged };
-      return orig(toolCallId, next, signal, onUpdate, ctx);
+      const result = await orig(toolCallId, next, signal, onUpdate, ctx);
+      if (boundaryAudit) {
+        const reject = rejectCodeOf(result);
+        if (reject) {
+          const kind = (next as { kind?: unknown }).kind;
+          await boundaryAudit({
+            accountId,
+            reasonCode: reject.code,
+            message: reject.message,
+            toolCallId,
+            sceneId: pre.sceneId,
+            virtualTs: pre.virtualTs,
+            attemptedKind: typeof kind === "string" ? kind : undefined,
+          });
+        }
+      }
+      return result;
     },
   };
 }
@@ -117,7 +193,7 @@ async function assembleTools(
   const extProvider = (accountId: string) => opts.extProvider?.(accountId) ?? {};
   const builtins = ctx.tools
     .filter((t) => allowed.has(t.name as MeshToolName))
-    .map((t) => decorateMeshSend(t, extProvider));
+    .map((t) => decorateMeshSend(t, ctx.account.id, extProvider, opts.boundaryAudit));
   const handlers = (await opts.domainHandlersFor?.(ctx.account.id)) ?? opts.domainHandlers;
   const domain = domainToolsFor(kind, handlers);
   return [...builtins, ...domain];

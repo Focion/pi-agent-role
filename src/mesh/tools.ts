@@ -87,6 +87,10 @@ const SPECS: Record<DomainToolName, ToolSpec> = {
           items: { type: "string" },
           description: "相关主体 id（person:* / facility:* / self 等）",
         },
+        purpose: {
+          type: "string",
+          description: "通用用途标签（§17.6，当前仅 teaching_progress；系统自动抬高显著度 + 重复记账）",
+        },
       },
       required: ["gist"],
       additionalProperties: false,
@@ -107,8 +111,17 @@ const SPECS: Record<DomainToolName, ToolSpec> = {
   },
   identity_read: {
     label: "读自己的身份定义",
-    description: "读自己的身份定义（只读）。模板回写走 rt.agents.respec，不由模型触发（C5）。",
-    parameters: { type: "object", additionalProperties: false },
+    description:
+      "读自己的身份定义（只读）。可读 section 限于编译期白名单（lazySections），越界返回本环定义的拒绝。" +
+      "模板回写走 rt.agents.respec，不由模型触发（C5）。",
+    parameters: {
+      type: "object",
+      properties: {
+        section: { type: "string", description: "身份维度段名，如 psychology / academic / knowledge_boundaries" },
+      },
+      required: ["section"],
+      additionalProperties: false,
+    },
   },
   reflect_result: {
     label: "提交自省结论",
@@ -144,36 +157,59 @@ const SPECS: Record<DomainToolName, ToolSpec> = {
   },
   facility_query: {
     label: "查询设施自身状态",
-    description: "被问时查自身状态。应答必须携带当前 correlationId（§3.2）。",
-    parameters: { type: "object", additionalProperties: false },
-  },
-  facility_report: {
-    label: "输出设施应答",
-    description: "输出应答内容，携带当前 correlationId（§3.2）。",
+    description: "按功能域读设施模型的结构化数据（只读，§5.5 L1）。应答必须携带当前 correlationId（§3.2）。",
     parameters: {
       type: "object",
-      properties: { content: { type: "string" } },
-      required: ["content"],
+      properties: {
+        facilityId: { type: "string", description: "要查询的设施 id（作用域锁死在当前场景的设施）" },
+        domain: {
+          type: "string",
+          description: "功能域：basic | time | capacity | rules | services | resources | pricing | relations",
+        },
+      },
+      required: ["facilityId", "domain"],
+      additionalProperties: false,
+    },
+  },
+  facility_report: {
+    label: "输出设施聚合统计",
+    description: "按功能域聚合设施事实流水（不暴露原始流水，§16.3）。window 为最近 N 条。",
+    parameters: {
+      type: "object",
+      properties: {
+        facilityId: { type: "string", description: "设施 id" },
+        window: { type: "number", description: "最近 N 条流水（缺省全量）" },
+      },
+      required: ["facilityId"],
       additionalProperties: false,
     },
   },
   facility_enforce: {
-    label: "执行设施规则",
-    description: "执行物理约束/规则（如「座位已满」）。产生的通告是 kind:event，走 Router.route。",
+    label: "执行设施规则判定",
+    description: "执行物理约束/规则判定，返回 { allowed, reason, escalation? }。由 Orchestrator 调用，不给角色 Agent；判定本身不发消息（§3.8 / §21.4 ②）。",
     parameters: {
       type: "object",
-      properties: { rule: { type: "string" }, detail: { type: "object" } },
-      required: ["rule"],
+      properties: {
+        facilityId: { type: "string", description: "设施 id" },
+        action: { type: "string", description: "要判定的动作（规则 id 或规则文本关键字）" },
+        agent: { type: "string", description: "触发判定的主体 id（可空）" },
+        time: { type: "string", description: "判定时刻的虚拟时间字面量（可空）" },
+      },
+      required: ["facilityId", "action"],
       additionalProperties: false,
     },
   },
   facility_record: {
     label: "写设施事实记录",
-    description: "写自身事实记录到 facility_state（设施无主观记忆，不写 episodes，C7）。",
+    description: "仅追加一条事实流水到 facility_records（设施无主观记忆，不写 episodes，C7）。不经 LLM 改写。",
     parameters: {
       type: "object",
-      properties: { fact: { type: "string" } },
-      required: ["fact"],
+      properties: {
+        facilityId: { type: "string", description: "设施 id" },
+        kind: { type: "string", description: "usage | incident | maintenance" },
+        data: { type: "object", description: "结构化事实载荷" },
+      },
+      required: ["facilityId", "kind", "data"],
       additionalProperties: false,
     },
   },

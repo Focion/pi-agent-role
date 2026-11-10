@@ -57,7 +57,9 @@ export function meshTimelineEvidence(
     const placeholders = msgIds.map(() => "?").join(",");
     const messages = db
       .prepare<unknown[], MeshMessageRow>(
-        `SELECT id, conversation_id, seq, from_account, kind, text, routed_at
+        `SELECT id, conversation_id, seq, from_account, kind,
+                COALESCE(json_extract(payload, '$.text'), '') AS text,
+                routed_at
            FROM mesh_messages
           WHERE id IN (${placeholders})`,
       )
@@ -83,6 +85,13 @@ export function meshTimelineEvidence(
 
     for (const m of messages) {
       const d = deliveriesByMsg.get(m.id);
+      // R36：角色展示只看「本人发 / 本人收」。定向他人且非本人发出的消息，其原文对
+      // 本角色不可见——不纳入结果（调用方据此降级 L1/L2 且不暴露 text）。「无投递行
+      // 不直接等于无权」：本人发出的消息没有投递给自己，仍属可见；「也不直接返回 L0」：
+      // 既非发件人亦无投递行的消息不因存在于 mesh_messages 就升 L0。管理审计的
+      // 全量核对走 dangling-scan，不走本展示路径。
+      const selfSent = m.from_account === accountId;
+      if (!selfSent && !d) continue;
       result.set(m.id, {
         conversationId: m.conversation_id,
         seq: m.seq,
