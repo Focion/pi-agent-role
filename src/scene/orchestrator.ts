@@ -18,18 +18,23 @@ import type { AccountId, Cap, ConversationId } from "../mesh/public-types.js";
 import type { UsageBreakdown } from "../mesh/pi-backend.js";
 import { ValidationError } from "../runtime/errors.js";
 import { advanceVirtualTs } from "./clock.js";
-import { buildCue, sendCue } from "./cue.js";
+import { buildCue, sendCue, sendNarration } from "./cue.js";
 import { decodeParticipants } from "./scenes-dao.js";
 import {
   buildRoleStateLookup,
   buildSceneFloorState,
   pickNextSpeaker,
+  pickScriptSpeaker,
+  resolveScriptTarget,
 } from "./state-snapshot.js";
 import type {
   CueAudit,
+  DirectorScript,
   FloorMode,
   RoleStateLookup,
   SceneEstablished,
+  SceneInjection,
+  SceneInjectionInput,
   SceneOrchestrator,
   SceneOrchestratorDeps,
   SceneOrchestratorFactory,
@@ -117,10 +122,11 @@ function speakerCandidates(
 interface TurnPolicy {
   maxTurns?: number;
   turnDurationMinutes?: number;
+  script?: DirectorScript;
 }
 
-function serializeTurnPolicy(maxTurns: number | undefined, turnDurationMinutes: number): string {
-  return JSON.stringify({ maxTurns, turnDurationMinutes });
+function serializeTurnPolicy(maxTurns: number | undefined, turnDurationMinutes: number, script?: DirectorScript): string {
+  return JSON.stringify({ maxTurns, turnDurationMinutes, script });
 }
 
 function parseTurnPolicy(json: string | null): TurnPolicy {
@@ -131,10 +137,24 @@ function parseTurnPolicy(json: string | null): TurnPolicy {
       maxTurns: typeof v.maxTurns === "number" ? v.maxTurns : undefined,
       turnDurationMinutes:
         typeof v.turnDurationMinutes === "number" ? v.turnDurationMinutes : undefined,
+      script: isDirectorScript(v.script) ? v.script : undefined,
     };
   } catch {
     return {}; // 损坏的 turn_policy 视为未配置（宁可从宽，别让场景打不开）
   }
+}
+
+/** 结构守卫：只有形状合法的剧本才恢复，否则按无剧本退化为基础轮转（防御性边界）。 */
+function isDirectorScript(v: unknown): v is DirectorScript {
+  if (v === null || typeof v !== "object") return false;
+  const o = v as Record<string, unknown>;
+  if (!Array.isArray(o.steps)) return false;
+  return o.steps.every(
+    (s) =>
+      s !== null &&
+      typeof s === "object" &&
+      typeof (s as Record<string, unknown>).target === "string",
+  );
 }
 
 // ─── 点名选人（与 floor 策略槽同一套打分口径，§7.2）───────────────────────
@@ -343,6 +363,19 @@ export const createSceneOrchestrator: SceneOrchestratorFactory = (deps: SceneOrc
       }
     }
 
+    // O02：导演剧本上线前校验——每个 step.target 都必须解析到非 observer 的在场参与者。
+    // 未知目标 / observer 目标在建档即拒绝（清晰失败边界），运行时只剩脚本播完的 idle。
+    if (spec.script) {
+      for (const step of spec.script.steps) {
+        const p = resolveScriptTarget(step.target, participants);
+        if (!p || p.role === "observer") {
+          throw new ValidationError(
+            `director script references non-speakable target: ${step.target} (scene ${spec.sceneId})`,
+          );
+        }
+      }
+    }
+
     dao.insert({
       sceneId: spec.sceneId,
       name: spec.name ?? null,
@@ -355,7 +388,7 @@ export const createSceneOrchestrator: SceneOrchestratorFactory = (deps: SceneOrc
       virtualStart,
       virtualNow: virtualStart,
       participants,
-      turnPolicy: serializeTurnPolicy(spec.maxTurns, spec.turnDurationMinutes ?? DEFAULT_TURN_DURATION_MINUTES),
+      turnPolicy: serializeTurnPolicy(spec.maxTurns, spec.turnDurationMinutes ?? DEFAULT_TURN_DURATION_MINUTES, spec.script),
       tokenBudget: spec.tokenBudget ?? null,
       createdAt,
     });
@@ -386,6 +419,10 @@ export const createSceneOrchestrator: SceneOrchestratorFactory = (deps: SceneOrc
   async function driveOnce(sceneId: string, opts?: { signal?: AbortSignal; maxTurns?: number; tokenBudget?: number }): Promise<SceneRunResult> {
     const row = dao.get(sceneId);
     if (!row) throw new ValidationError(`scene not found: ${sceneId}`);
+    if (row.status === "paused") {
+      // O04：暂停态驱动（他没经过 resume 直接 run）不再推进，明确回报 paused 而非吞成 closed。
+      return { sceneId, stopReason: "paused", turnsCompleted: row.turnCount, tokensThisRun: 0, tokensCumulative: row.tokenSpent, queueClearedDetected: await queueCleared(), dissolved: false, degradeTrace: [], invariantViolations: [] };
+    }
     if (row.status !== "active") {
       return { sceneId, stopReason: "closed", turnsCompleted: row.turnCount, tokensThisRun: 0, tokensCumulative: row.tokenSpent, queueClearedDetected: await queueCleared(), dissolved: false, degradeTrace: [], invariantViolations: [] };
     }
@@ -456,7 +493,7 @@ export const createSceneOrchestrator: SceneOrchestratorFactory = (deps: SceneOrc
         //    不再推进。只看开头一次会漏掉并发 close（run 已持有 row 快照后仍继续发 cue）。
         const live = dao.get(sceneId);
         if (!live || live.status !== "active") {
-          stopReason = "closed";
+          stopReason = live?.status === "paused" ? "paused" : "closed";
           break;
         }
         // ① abort（run/resume 也只在这一处响应 AbortSignal）
@@ -492,13 +529,28 @@ export const createSceneOrchestrator: SceneOrchestratorFactory = (deps: SceneOrc
           addressed,
         });
 
-        // ④ 点名（free_for_all 不点名，只推进时钟）
+        // ④ 点名（free_for_all 不点名，只推进时钟；director 有剧本则按剧本点，否则回落轮转）
         let addressee: AccountId | null = null;
+        let scriptText: string | undefined;
         if (floorMode !== "free_for_all") {
-          addressee = pickAddressee(floorMode, candidates, speakerOrder, silenced, lookup);
-          if (addressee === null) {
-            stopReason = "idle"; // 无可点名者（无 speak 候选）
-            break;
+          if (floorMode === "director" && policy.script) {
+            const loop = policy.script.loop ?? false;
+            const absIdx = row.turnCount + completed; // 0 基绝对轮次（跨 resume 稳定）
+            addressee = pickScriptSpeaker(policy.script.steps, absIdx, loop, participants);
+            if (addressee === null) {
+              stopReason = "idle"; // 非 loop 脚本播完（失败边界：无剩余剧本行）
+              break;
+            }
+            const step = loop
+              ? policy.script.steps[absIdx % policy.script.steps.length]
+              : policy.script.steps[absIdx];
+            scriptText = step?.text;
+          } else {
+            addressee = pickAddressee(floorMode, candidates, speakerOrder, silenced, lookup);
+            if (addressee === null) {
+              stopReason = "idle"; // 无可点名者（无 speak 候选）
+              break;
+            }
           }
         }
         // ⑤ 快照注入（cue 前）：floor 策略槽读它决定「这条消息的发送者能不能说话」。
@@ -533,7 +585,7 @@ export const createSceneOrchestrator: SceneOrchestratorFactory = (deps: SceneOrc
             sceneId,
             turn,
             virtualTs: virtualNow,
-            text: cueText(sceneId, turn, virtualNow),
+            text: scriptText ?? cueText(sceneId, turn, virtualNow),
             audit: cueAuditFor(floorMode),
           });
           const sent = await sendCue(mesh, {
@@ -595,6 +647,87 @@ export const createSceneOrchestrator: SceneOrchestratorFactory = (deps: SceneOrc
     // 不是场景异常），resume 从 turn_count 无损续上。旧的 beforeClearQueue 协议已随 mesh v0.2.0
     // 移除（M04），此处不再重排队列，队列也从未被清空。
     return { sceneId, stopReason, turnsCompleted: completed, tokensThisRun: runSpent, tokensCumulative: tokenSpent, queueClearedDetected: await queueCleared(), dissolved: false, degradeTrace: [], invariantViolations: [] };
+  }
+
+  async function pause(sceneId: string): Promise<SceneRunResult> {
+    const row = dao.get(sceneId);
+    if (!row) throw new ValidationError(`scene not found: ${sceneId}`);
+    // O04：ended/aborted 是终态，不可暂停；active→paused（条件写，已暂停/并发终态则 0 行生效）。
+    if (row.status === "ended" || row.status === "aborted") {
+      throw new ValidationError(`scene already ${row.status}, cannot pause: ${sceneId}`);
+    }
+    dao.pause(sceneId);
+    const fresh = dao.get(sceneId);
+    return {
+      sceneId,
+      stopReason: "paused",
+      turnsCompleted: fresh?.turnCount ?? row.turnCount,
+      tokensThisRun: 0,
+      tokensCumulative: fresh?.tokenSpent ?? row.tokenSpent,
+      queueClearedDetected: await queueCleared(),
+      dissolved: false,
+      degradeTrace: [],
+      invariantViolations: [],
+    };
+  }
+
+  /** O04：resume = 从 paused 恢复为 active 再继续 drive；ended/aborted 是终态不可恢复。 */
+  async function resumeScene(sceneId: string, opts?: { signal?: AbortSignal; maxTurns?: number; tokenBudget?: number }): Promise<SceneRunResult> {
+    const row = dao.get(sceneId);
+    if (!row) throw new ValidationError(`scene not found: ${sceneId}`);
+    if (row.status === "ended" || row.status === "aborted") {
+      throw new ValidationError(`scene already ${row.status}, cannot resume: ${sceneId}`);
+    }
+    if (row.status === "paused") dao.unpause(sceneId);
+    return await drive(sceneId, opts);
+  }
+
+  /** 注入（O05）：授权 + 归属 + 审计 + 幂等恢复。 */
+  async function inject(input: SceneInjectionInput): Promise<SceneInjection> {
+    // 幂等恢复：同 injectId 的重复请求（重试 / 崩溃后重启）直接回读已记账的注入，不重发。
+    const existing = dao.getInjection(input.injectId);
+    if (existing) return existing;
+
+    const row = dao.get(input.sceneId);
+    if (!row) throw new ValidationError(`scene not found: ${input.sceneId}`);
+    // 终态场景不再接受注入（旁白属于运行中/暂停中的场景；结束后不接受新旁白）。
+    if (row.status === "ended" || row.status === "aborted") {
+      throw new ValidationError(`scene already ${row.status}, cannot inject: ${input.sceneId}`);
+    }
+    if (!row.conversationId) throw new ValidationError(`scene not bound to a conversation: ${input.sceneId}`);
+
+    // 授权 + 归属：归属账号必须是被授权发 kind:"system" 的 host（场景 host / deps.host / @system）。
+    // 角色参与者的 initiate 不含 system（§3.1），不能充当旁白发送者。
+    const resolvedHost = resolveHost(row.hostAccountId ?? undefined, deps.hostAccountId);
+    const authorized = new Set<AccountId>([SYSTEM_ACCOUNT, ...(deps.hostAccountId ? [deps.hostAccountId] : []), ...(row.hostAccountId ? [row.hostAccountId] : [])]);
+    const from = input.from ?? resolvedHost;
+    if (!authorized.has(from)) {
+      throw new ValidationError(`inject from account not authorized as host: ${from}`);
+    }
+
+    const virtualTs = row.virtualNow ?? row.virtualStart ?? DEFAULT_VIRTUAL_START;
+    // 发送在记账之前：若进程在 send 成功、record 之前崩溃，重启后重试会同 injectId 再发一次
+    // （旁白无唤醒副作用、正文幂等，at-least-once 可接受；不像 close/harvest 冒称 exactly-once）。
+    const sent = await sendNarration(mesh, {
+      from,
+      conversationId: row.conversationId,
+      sceneId: input.sceneId,
+      virtualTs,
+      text: input.text,
+    });
+    const inj: SceneInjection = {
+      injectId: input.injectId,
+      sceneId: input.sceneId,
+      conversationId: row.conversationId,
+      messageId: sent.messageId,
+      fromAccount: from,
+      msgClass: "narration",
+      text: input.text,
+      virtualTs,
+      createdAt: now(),
+    };
+    dao.recordInjection(inj);
+    return inj;
   }
 
   async function close(sceneId: string): Promise<SceneRunResult> {
@@ -678,7 +811,9 @@ export const createSceneOrchestrator: SceneOrchestratorFactory = (deps: SceneOrc
   const orchestrator: SceneOrchestrator = {
     create,
     run: (sceneId, opts) => drive(sceneId, opts),
-    resume: (sceneId, opts) => drive(sceneId, opts),
+    resume: (sceneId, opts) => resumeScene(sceneId, opts),
+    pause,
+    inject,
     close,
     get: (sceneId) => dao.get(sceneId),
   };

@@ -27,6 +27,10 @@ export const RETRIEVAL_BUDGET = {
   l1: 900,
   transient: 150,
   total: 2750,
+  /** §17.6 / Q09：教学进度（teaching_progress）注入的独立配额——不占 L1/L2/瞬时池。 */
+  teachingProgress: 200,
+  /** 含教学进度后的总台线上限（2750 + 200）。 */
+  totalWithProgress: 2950,
 } as const;
 
 /** recall 配额（§14.5.3）：与自动注入共享 L1 的 900 token 池，但保留 300 底线。 */

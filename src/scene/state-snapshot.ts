@@ -13,6 +13,7 @@
 
 import type { AccountId, ConversationId } from "../mesh/public-types.js";
 import type {
+  DirectorStep,
   FloorMode,
   RoleStateLookup,
   RoleTurnState,
@@ -112,4 +113,38 @@ export function pickNextSpeaker(
   if (last === undefined) return eligible[0] ?? null;
   const idx = eligible.indexOf(last);
   return idx < 0 ? (eligible[0] ?? null) : (eligible[(idx + 1) % eligible.length] ?? eligible[0] ?? null);
+}
+
+/**
+ * 导演剧本目标解析（O02）：target 先按 agentId 精确匹配，再按角色名匹配第一个该角色
+ * 参与者。找不到返回 undefined（建场景时据此报 ValidationError，运行时据此 skip）。
+ */
+export function resolveScriptTarget(
+  target: string,
+  participants: readonly SceneParticipant[],
+): SceneParticipant | undefined {
+  return participants.find((p) => p.agentId === target) ?? participants.find((p) => p.role === target);
+}
+
+/**
+ * director 剧本选下一被点名者（O02）：
+ *   - absoluteTurnIndex 是 0 基绝对轮次（turn_count 派生，跨 resume 稳定）；
+ *   - `loop` 真则取模回绕，假则越界返回 null（脚本播完 → idle）；
+ *   - 解析失败或目标是 observer（无 speak 权）返回 null（上线前已被 create 校验拦截，
+ *     这里仍是防御性失败边界——永不把 observer/未知目标推到 cue 的 to）。
+ */
+export function pickScriptSpeaker(
+  steps: readonly DirectorStep[],
+  absoluteTurnIndex: number,
+  loop: boolean,
+  participants: readonly SceneParticipant[],
+): AccountId | null {
+  if (steps.length === 0) return null;
+  const idx = loop ? absoluteTurnIndex % steps.length : absoluteTurnIndex < steps.length ? absoluteTurnIndex : -1;
+  if (idx < 0) return null;
+  const step = steps[idx];
+  if (!step) return null;
+  const p = resolveScriptTarget(step.target, participants);
+  if (!p || p.role === "observer") return null;
+  return p.meshAccountId;
 }

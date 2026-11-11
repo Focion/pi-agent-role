@@ -1,7 +1,7 @@
 // ═══════════════════════════════════════════════════════════════════════════
 // role-agent.db 打开与迁移（§18 权威出处的执行器）
 //
-// · DB-A（本环领域库）封闭表集（附录 E；迁移 001–006，含 A23 的 compact_distilled 辅助台账与 R10 退役列）；
+// · DB-A（本环领域库）封闭表集（附录 E；迁移 001–009，含 A23 的 compact_distilled 辅助台账、R10 退役列、O05 场景注入台账、Q05 pending_taught 与 Q09 tokens_purpose）；
 // · 版本跟踪用 SQLite `PRAGMA user_version`，**不建 meta 表**——附封闭闸门
 //   （§18.7 P10：本环连接内不得出现任何 mesh_ 表对象）。
 // · 纪律（§18.7 P10）：打开后断言无 mesh_ 前缀对象、PRAGMA database_list 只有 main（+temp），
@@ -43,7 +43,7 @@ export function assertDistinctDbPaths(roleDbPath: string, meshDbPath: string): v
 }
 
 /** schema 版本基准：与 migrations/ 的最大序号一致（§28.3 镜像 mesh 的做法）。 */
-export const SCHEMA_VERSION = 7;
+export const SCHEMA_VERSION = 9;
 
 const MODULE_DIR = dirname(fileURLToPath(import.meta.url));
 

@@ -17,6 +17,7 @@ export type IdKind =
   | "be" // boundary_events
   | "fr" // facility_records
   | "sp" // subject_profiles（不独立主键，此处留用）
+  | "pt" // pending_taught（§17.2 Q05 双证据中转台账）
   | "ag"; // agents（无 prefix 需求时兜底）
 
 /** 生成带前缀的领域主键，如 `ep_<uuid>`。 */

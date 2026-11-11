@@ -1,13 +1,18 @@
 ---
 title: pi-agent-role 落地计划（P0–P6 + PA）
 date: 2026-09-14
-status: active
+status: archived
+archived_date: 2026-11-02
+archived_from: notes/plan/2026-09-14-pi-agent-role-rollout.md
+archived_reason: 被 notes/plan/2026-11-02-consolidated-audit-and-mesh-alignment-plan.md 接管
 owner: 待定
 tags: [plan, role-agent, mesh]
 related:
   - notes/tech/ROLE-AGENT-DESIGN.md
   - notes/tech/2026-09-14-mesh-strategy-slot-signatures.md
 ---
+
+> **已归档（2026-11-02）**：本文档不再有效，请参见 `notes/plan/2026-11-02-consolidated-audit-and-mesh-alignment-plan.md`。
 
 ## 目标
 

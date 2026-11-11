@@ -134,6 +134,16 @@ export type KnowledgeVerdict =
       /** true = 同态复述（T6），只维护计数不迁移。 */
       practiced: boolean;
       /**
+       * `taught` 证据延迟成立（§17.2 Q05）：讲者双主体情节满足、听者侧迁移尚未落地，
+       * 本轮**不**把 mastered 成立，只记 pending_taught 等日终回补。出现时 `to` 仍是
+       * 当前状态（applied），调用方不得把本裁决当成「已 mastered」。
+       */
+      taughtPending?: {
+        pendingId: string;
+        /** 听者序列化 SubjectRef（person:<id>），从证据情节的双主体解析。 */
+        listener: string;
+      };
+      /**
        * 误区被纠正（§17.4.2 高价值事件）：本轮把既有 is_misconception 从 1 清成 0。
        * 出现时调用方应写一条系统抬高 salience 的情报（双主体 person:纠正者 + knowledge:topic）。
        */
@@ -161,6 +171,12 @@ export interface LearningQueueItem {
   topic: string; // kn:<slug>
   priority: "high" | "medium" | "low";
   motivation: string; // 「上次被问住了」/「竞赛要考」
+  /**
+   * 入队虚拟小时（服务端补写，非模型产出的字段）。随 output_json 往返，供 Q2「连续 3 个
+   * 虚拟日未被触及 ⇒ 降档」起算：lastTouched = max(enqueuedVhours, knowledge_items .last_practiced_vhours)。
+   * 缺省（历史队列 / 模型旧协议）视为「刚刚入队」——不下调。
+   */
+  enqueuedVhours?: number;
 }
 
 /** classifyUpdate 的纯函数裁决（不落库；service 据它写）。 */

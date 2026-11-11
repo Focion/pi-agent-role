@@ -58,7 +58,8 @@ export interface MemoryDecision {
   virtualTs: string;
 }
 
-/** 一条检索候选：episodes 行 + FTS 的 bm25（负值，越负越相关）。 */
+/** 一条检索候选：episodes 行 + 后端导出的相关性。`bm25` 是 FTS 原始分（负值，非 FTS 后端为 0）；
+ *  `relevance` 是统一相关性（越高越相关），FTS 后端 = -bm25，交给 retrieve 归一。 */
 export interface EpisodeCandidate {
   episodeId: string;
   ownerAgent: string;
@@ -79,6 +80,7 @@ export interface EpisodeCandidate {
   retention: number;
   status: "active" | "faded" | "consolidated";
   bm25: number;
+  relevance: number;
 }
 
 export interface DecaySweepResult {
@@ -93,7 +95,8 @@ export interface DecaySweepResult {
 
 const clamp01 = (x: number): number => (x < 0 ? 0 : x > 1 ? 1 : x);
 
-/** episodes 行 + 显式 bm25 → EpisodeCandidate（searchCandidates 与主体候选共用）。 */
+/** episodes 行 + 显式 bm25 → EpisodeCandidate（searchCandidates 与主体候选共用）。
+ *  relevance = -bm25（越高越相关）；主体候选/用途候选 bm25=0 → relevance=0。 */
 function rowToCandidate(r: Record<string, unknown>, bm25: number): EpisodeCandidate {
   return {
     episodeId: r.episode_id as string,
@@ -115,6 +118,7 @@ function rowToCandidate(r: Record<string, unknown>, bm25: number): EpisodeCandid
     retention: r.retention as number,
     status: r.status as "active" | "faded" | "consolidated",
     bm25,
+    relevance: -bm25,
   };
 }
 
@@ -702,6 +706,7 @@ export class MemoryDao {
     tokensL2: number;
     tokensL1: number;
     tokensTransient: number;
+    tokensPurpose: number;
     tokensTotal: number;
     clamped: number;
     renderedCard: string;
@@ -713,11 +718,11 @@ export class MemoryDao {
         INSERT INTO retrieval_log
           (retrieval_id, owner_agent, scene_id, turn, trigger_msg_id,
            query_json, candidates, selected_json,
-           tokens_l2, tokens_l1, tokens_transient, tokens_total, clamped,
+           tokens_l2, tokens_l1, tokens_transient, tokens_purpose, tokens_total, clamped,
            rendered_card, card_sha256, real_ts, model_config_hash)
         VALUES (@rid, @ownerAgent, @sceneId, @turn, @triggerMsgId,
                 @queryJson, @candidates, @selectedJson,
-                @tokensL2, @tokensL1, @tokensTransient, @tokensTotal, @clamped,
+                @tokensL2, @tokensL1, @tokensTransient, @tokensPurpose, @tokensTotal, @clamped,
                 @renderedCard, @cardSha256, @realTs, @modelConfigHash)
       `)
       .run({
@@ -732,6 +737,7 @@ export class MemoryDao {
         tokensL2: row.tokensL2,
         tokensL1: row.tokensL1,
         tokensTransient: row.tokensTransient,
+        tokensPurpose: row.tokensPurpose,
         tokensTotal: row.tokensTotal,
         clamped: row.clamped,
         renderedCard: row.renderedCard,

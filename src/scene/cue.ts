@@ -83,3 +83,27 @@ export function buildCue(args: BuildCueArgs): CueMessage {
 }
 
 export type { CueReason };
+
+/** 旁白（narration）发送入参（O05 scenes.inject）：kind:"system" + msgClass:"narration"，
+ *  `expect:"none"` 且无 to/mentions —— 旁白不该唤醒任何人（§3.5 / §7.2）。from 是 host/@system。 */
+export interface NarrationSendArgs {
+  from: AccountId;
+  conversationId: ConversationId;
+  sceneId: string;
+  virtualTs: string;
+  text: string;
+}
+
+/** 注入一条旁白（不点名、不唤醒），返回 mesh 分配的 messageId/seq。 */
+export function sendNarration(mesh: MeshHost, args: NarrationSendArgs): Promise<{ messageId: string; seq: number }> {
+  const ext: RoleExt = { sceneId: args.sceneId, virtualTs: args.virtualTs, msgClass: "narration" };
+  const input: SendInput & { from: string } = {
+    from: args.from,
+    conversationId: args.conversationId,
+    kind: "system",
+    expect: "none",
+    text: args.text,
+    ext,
+  };
+  return mesh.send(input);
+}

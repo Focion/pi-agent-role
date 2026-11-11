@@ -4,7 +4,7 @@
 // 用真实 DB-A DDL（openRoleDb）+ KnowledgeService 直接驱动（不走 mesh / 反射往返），验证：
 //   · T1–T11 封闭迁移集：合法边推进、非法边驳回（ILLEGAL_TRANSITION / EVIDENCE_MISSING）；
 //   · evidenceEpisode 的 NOT_FOUND / NOT_OWNED 区分；
-//   · T4 mastered 的「≥2 solved 且跨 ≥2 虚拟日」查库门槛；taught 证据直通；
+//   · T4 mastered 的「≥2 solved 且跨 ≥2 虚拟日」查库门槛；taught 双主体情节门槛；
 //   · T5 跳级补中间事件，补写事件不计入 second solved；
 //   · T6 同态只维护计数（practiced，无事件）；T11 纠错降级 + 置误区 + wrong_belief 保留；
 //   · confidence 单次 ±0.15 限幅；taught_by 归因（未知 person → self）；
@@ -93,13 +93,14 @@ describe("P5 知识状态机（§17.1/§17.2）", () => {
     expect(solved.n).toBe(2); // applied 的 1 次 + mastered 的第 2 次（被 T4 拒绝的那次未落库）
   });
 
-  it("T4 mastered 的 solved 门槛；taught 证据直通不查库", () => {
+  it("T4 mastered 的 solved 门槛；taught 需讲者双主体情节否则驳回", () => {
     const { svc } = setup();
-    // taught 从 applied→mastered 直通（cross-owner 校验延迟成立，见 §17.2 尾段）。
+    // taught 从 applied→mastered 需讲者的双主体情节（person:听者 + knowledge:topic，§17.2 Q05）。
+    // 无证据情节直接驳回（EVIDENCE_MISSING），不再「直通不查库」。
     svc.applyUpdate("ag-stu", proposal("kn:b", "heard", "mentioned"), { virtualTs: "W1D1T8" });
     svc.applyUpdate("ag-stu", proposal("kn:b", "applied", "solved"), { virtualTs: "W1D1T9" });
     const masteredViaTaught = svc.applyUpdate("ag-stu", proposal("kn:b", "mastered", "taught", { taughtBy: "person:ag-teacher-01" }), { virtualTs: "W1D1T10" });
-    expect(masteredViaTaught).toMatchObject({ ok: true, to: "mastered" });
+    expect(masteredViaTaught).toMatchObject({ ok: false, reason: "EVIDENCE_MISSING" });
   });
 
   it("T5 跳级 heard→applied 补中间事件，且不把补写事件算作 second solved", () => {

@@ -35,7 +35,7 @@ import type {
   ReflectSnapshot,
   ReflectionTrigger,
 } from "../reflect/types.js";
-import type { FloorMode, SceneEstablished, SceneParticipantRole, SceneRunResult } from "../scene/types.js";
+import type { DirectorScript, FloorMode, SceneEstablished, SceneInjection, SceneInjectionInput, SceneParticipantRole, SceneRunResult } from "../scene/types.js";
 
 import type { VirtualTs, VirtualClockMode } from "./virtual-clock.js";
 
@@ -74,6 +74,39 @@ export interface BlueprintApi {
   promote(stagingId: string, opts?: PromoteInput): Promise<PromoteResult>;
 }
 
+/** §6.4 谱系元数据：导出的新蓝本的血缘（generation 0 = 手写原始蓝本）。 */
+export interface BlueprintLineage {
+  blueprintId: string;
+  blueprintHash: string;
+  /** 直接父蓝本 id；原始蓝本为 null。 */
+  derivedFrom: string | null;
+  /** 导出时的来源 Agent 与它当时的 promptVersion。 */
+  derivedFromAgent: { agentId: string; promptVersion: string; exportedAt: string } | null;
+  generation: number;
+}
+
+/** §6.4 exportAsBlueprint 入参。 */
+export interface ExportAsBlueprintInput {
+  agentId: string;
+  /** 新蓝本 id，不得等于来源蓝本 id。 */
+  blueprintId: string;
+  /** 导出哪些 growth 可写文件。取值域就是 §6.2 的四个：skills/specialties/social/shadow。
+   *  缺省只有 skills + specialties；social（须脱敏）与 shadow（最不可迁移）必须显式 include。 */
+  include?: Array<"skills" | "specialties" | "social" | "shadow">;
+  /** 是否把当前 modelConfig 写入新蓝本的 model_defaults.yaml；默认 false。 */
+  freezeModelConfig?: boolean;
+  /** 谱系元数据的作者与说明。 */
+  note?: string;
+}
+
+/** §6.4 exportAsBlueprint 返回值（blueprintDir 为相对 root 的落点，供宿主 diff/复用）。 */
+export interface ExportAsBlueprintResult {
+  blueprintId: string;
+  blueprintDir: string;
+  blueprintHash: string;
+  lineage: BlueprintLineage;
+}
+
 /** 角色 Agent：创建 / 删除 / 编译 / 查询（§4）。P1 实装 create + reconcile。 */
 export interface AgentApi {
   /** §4.2 八步：物化 → 编译 → 落库 → 注册 mesh（dialogue Account/Endpoint）→ 回写映射。 */
@@ -96,6 +129,8 @@ export interface AgentApi {
   restore(agentId: string): RestoreResult;
   /** R10 永久删除 role 侧行 + 实例目录；mesh 历史保留。不可逆。 */
   deleteAgent(agentId: string): DeleteAgentResult;
+  /** O01 / §6.4：从可信成长状态导出谱系 + 隐私受控的新蓝本，不覆盖来源蓝本。 */
+  exportAsBlueprint(input: ExportAsBlueprintInput): Promise<ExportAsBlueprintResult>;
 }
 
 /** §4.2 `create()` 入参。注册参数不由调用方提供，而由身份编译器算出（C1）。 */
@@ -269,6 +304,10 @@ export interface SceneApi {
   run(sceneId: string, signal?: AbortSignal, opts?: SceneRunOptions): Promise<SceneRunResult>;
   /** 恢复一个仍在 active 的场景接着跑（读 scenes 行，不重建成员）。 */
   resume(sceneId: string, signal?: AbortSignal, opts?: SceneRunOptions): Promise<SceneRunResult>;
+  /** 暂停（O04）：status→'paused'，持久化；不解散会话、不跑日终；resume 从停点无损续上。 */
+  pause(sceneId: string): Promise<SceneRunResult>;
+  /** 注入（O05）：往运行中/暂停中场景发一条旁白，授权/归属/审计/幂等恢复。 */
+  inject(input: SceneInjectionInput): Promise<SceneInjection>;
   /** 收尾（§7.5）：场景 status='ended'，不解散会话。 */
   close(sceneId: string): Promise<SceneRunResult>;
 }
@@ -294,6 +333,8 @@ export interface CreateSceneInput {
   turnDurationMinutes?: number;
   /** 发言权模式。默认 director。 */
   floorMode?: FloorMode;
+  /** director 模式的完整剧本（O02）；缺省则 director 退化为基础轮转。 */
+  script?: DirectorScript;
   maxTurns?: number;
   tokenBudget?: number;
   facilityId?: string;
@@ -410,6 +451,20 @@ export interface RuntimeOptions {
 
   /** DB-B：mesh 自持库路径，原样透传 createMesh({dbPath})。缺省 `${root}/mesh.db`（决议 D-B）。 */
   meshDb?: string;
+
+  /**
+   * O07 多进程部署透传（§19.3）：原样透传 createRoleMesh → createMesh，不复制通信运行时。
+   *   · transport:"sameHost" 用 SameHostTransport（同机多进程共享 meshDb 经 outbox 交叉投递），
+   *     缺省走 InProcessTransport + 单实例排他锁（单进程核心行为不变）。
+   *   · recoverDeadEndpoints 启动回收死写者遗留锁（§27.4）；busyTimeoutMs 显式设写锁等待（§19.5）。
+   * 注意与 `meshDb`（库路径）是两回事；本项只开关 mesh 通信层，role 库（DB-A）是否多进程共享不在此处约定。
+   */
+  mesh?: {
+    transport?: "sameHost";
+    transportOptions?: { pollIntervalMs?: number; claimTtlMs?: number; maxAttempts?: number };
+    recoverDeadEndpoints?: boolean;
+    busyTimeoutMs?: number;
+  };
 
   /**
    * R33 双库配对锚点账号 id（§18.2）。只用于在 mesh 里注册一个承载配对标识的锚点账号，

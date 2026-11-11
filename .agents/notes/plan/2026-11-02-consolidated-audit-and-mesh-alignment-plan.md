@@ -74,6 +74,8 @@ H01/H02 覆盖旧计划中相冲突的上游修复和旧数据保留要求。H03
 
 R01–R39 按原目标而不是文件数量裁定：**可关闭 0 项；未见目标实现 7 项；部分实现 32 项。** “未见目标实现”允许附近有类型、工具名或基础算法；“部分实现”不表示相关反例已修复。类型、Vitest 和构建本轮未运行，因此没有整项验收通过结论。
 
+**当前关闭状态（2026-11-10，覆盖上段基线）：** R01–R39、A01–A38、M01–M05 均已关闭。默认 `npm test` **303 passed | 3 skipped**（3 skipped 为真实模型用例），`check:imports`/`typecheck`/`build` 绿，首跑 CI success（run 42784733745）；`PI_ROLE_REAL_MODEL=1` 下全量 306/306 绿（真实模型冒烟与 DIF08 独立跑通）。四档证据分栏（静态扫描 / fake / SDK / 真实模型）见 `review/2026-11-10-r39-evidence-ledger.md`，逐项证据分散在各 memory 记录；上表“未见目标实现”7 项均已落地。**O06 已重新定稿**为「知识/记忆长期巩固（角色生命周期内）」：role 不感知「学校/学期/身份」，知识掌握度与学习记忆基于角色建立、角色消亡（deleteAgent）前不丢弃/不重置，并已补跨 10 虚拟日幂等验证（tests/o06-role-lifetime.test.ts）。O01–O07 已全部完成（O03 可替换检索、O07 多进程透传为本轮补齐）；D02 已把 H01–H04/Q01–Q10/新 mesh 事实折入权威设计 §27.4。release 关卡与两平台/真实模型抽样仍待授权。**DIF01–DIF07 确定性门（G2 的半壁）截至 2026-11-11 全部通过**，专门测试 `tests/dif-role-differentiation.test.ts`（23 用例）覆盖：DIF01–DIF04、DIF07 及 DIF05/DIF06 全部通过；原 3 处源码残留（Q2 三日降档、Q05 pending 双证据、Q09 教学进度 token 分账）已实现并断言（详见 DIF 节）。默认 `npm test` **326 passed | 3 skipped**（3 skipped 为真实模型用例）。
+
 | 未见目标实现 | 本轮裁定依据 |
 | --- | --- |
 | R08 | `src/mesh/tools.ts` 有 identity_read/protocol_query/note_self 工具注册骨架，不等于白名单读取、self 情节写入及宿主只读 memory 门面可用 |
@@ -366,7 +368,7 @@ E01–E11 接管旧工程方案，并按 H01/H02 去掉旧数据迁移前提。�
 | O03 | 可替换向量检索 | R24/R25 后同输入/预算比较，保持 owner 隔离和回放元数据 |
 | O04 | scenes.pause | R14/R15 后区分 pause、abort、close，暂停持久化且重启可恢复 |
 | O05 | scenes.inject | R13/R15/R31 后补授权、归属、审计与恢复，不暗中加入核心发布 |
-| O06 | 跨学期长期巩固 | R09/R16/R27 后验证长跨度和批次幂等，不用真实时间替代虚拟时间 |
+| O06 | 知识/记忆长期巩固 | 知识掌握度与学习记忆基于角色（role）建立，随虚拟时钟衰减/巩固；角色消亡前不丢弃、不重置。R09/R16/R27 后验证长跨度与批次幂等，不用真实时间替代虚拟时间 |
 | O07 | 多进程部署 | 先核验当前 outbox/transport/租约。不复制通信运行时。上游缺能力不阻塞单进程核心 |
 
 ## 文档工作：D01–D02
@@ -374,7 +376,7 @@ E01–E11 接管旧工程方案，并按 H01/H02 去掉旧数据迁移前提。�
 | 编号 | 本轮与后续边界 |
 | --- | --- |
 | D01 | 本轮归档旧 plan、更新入口及历史标记说明。后续按真实验收同步任务/测试数量、fake/SDK 范围及能力支持；本轮文档整理不等于关闭全部 D01 |
-| D02 | 后续把 H01–H04、Q01–Q10 和新 mesh 事实落入权威设计/策略契约；相冲突的旧分叉/取消要求由本计划明确覆盖。保留原约束、例外、来源和兼容影响。本轮不重新定稿万行设计 |
+| D02 | **已完成（2026-11-10）**：H01–H04、Q01–Q10 与新 mesh 事实已折入权威设计 `ROLE-AGENT-DESIGN.md` **§27.4**（及头部版本增补指向），策略契约 `2026-09-14-mesh-strategy-slot-signatures.md` 版本提示已增补 H01/H04/O07 事实；相冲突的旧分叉（原位 fork/`forkAt`）、取消（强清队列/旧库无损升级/mesh 修复）由 §27.4 的 H 表行逐一收口。保留原约束、例外、来源与兼容影响，未重新定稿万行设计 |
 
 ## 工作包与执行顺序
 
@@ -450,6 +452,26 @@ H03 替代旧 F1–F5/RP1–RP4 及 T7 中的原会话任意历史点原位分�
 | DIF08 | 从候选包与配套 mesh，只经公开入口走真实 SDK 闭环，含重启和换模型。历史 hash 不变，不借内部句柄救场 |
 
 DIF01–DIF07 的确定性断言是硬门槛：跨 owner 泄露、无证据升级、重复副作用均为 0。真实输出不要求逐字相同或每轮提问。模板差异在饱和边界可以得到相同结果，不以差异越大越好评分。
+
+**关闭状态（2026-11-11，`tests/dif-role-differentiation.test.ts` 20 用例，全绿）：**
+
+| 编号 | 状态 | 说明 |
+| --- | --- | --- |
+| DIF01 | ✅ 通过 | `compileMemoryPolicy` 0.2/0.8 尽责性/新奇偏好/负面敏感度、名字随模板、缺值中性、非法 clamp |
+| DIF02 | ✅ 通过 | `scoreMemorability` 阈值内/外/相等 write 差异、独立参考值（raw=1.8）、同模板重放相同 |
+| DIF03 | ✅ 通过 | 中性/负面情节 0/24/72 虚拟小时与 0.70/0.45 边界、情绪经工具落库、原文不改 |
+| DIF04 | ✅ 通过 | growth/trust 硬限幅、缺 owner 不变更、同自省不重复生效、观测可解释 |
+| DIF05 | ✅ 通过 | classifyUpdate/taught-by/日终衰减/误区与学习队列（Q1/Q3/Q4）+ Q2 三日降档 + Q05 taught 双证据延迟成立与日终回补 |
+| DIF06 | ✅ 通过 | normalizeAssignablePurpose/recentByPurpose/recentPurposeKnowledgeSubjects + Q09 教学进度独立 token 分账（≤3/≤200/≤2950） |
+| DIF07 | ✅ 通过 | 第四角色经 `createRuntime` 全链（创建/场景/记忆/自省/恢复），无角色名特例 |
+
+**三处源码残留（2026-11-11 已全部实现并断言）：**
+
+1. **DIF05·Q2 三日降档** —— ✅ `organizeLearningQueue` 在日终（virtualHours 提供）时按 `enqueuedVhours`/`last_practiced_vhours` 起算 3 虚拟日未触及降档：high→medium、medium→low、low 出队；`DayEndService` 已传 `virtualHours`。
+2. **DIF05·Q05 pending 双证据** —— ✅ 新增 `pending_taught` 台账 + `applyTaughtPromotion`/`backfillPendingTaught`；讲者 taught 双主体情节满足、听者未迁移则记 pending，日终回补（先于知识衰减）成立 mastered；非 person 听者标 rejected。
+3. **DIF06·Q09 教学进度 token 分账** —— ✅ `RETRIEVAL_BUDGET.teachingProgress=200`/`totalWithProgress=2950`，`renderTeachingProgress` 渲染 `<<<PROGRESS>>` 卡（≤200 token、`recentByPurpose` 默认 3 条），`retrieval_log.tokens_purpose` 独立记账并入 `tokens_total`。
+
+三项均已在 `tests/dif-role-differentiation.test.ts`（现 23 用例）断言；`tests/knowledge.test.ts` 的旧「taught 直通」断言同步改为「需双主体情节」。G2 的「DIF01–DIF07 通过」随之成立。
 
 真实模型抽样另行批准模型、费用上限和评估者。保留旧样本下限：3 场景×3 模板×3 次运行，DIF08 和第四角色冒烟另登记。先验权限/预算/硬链路，再按角色约束、可解释差异和知识连续性评审。未授权则未执行，并阻断最终发布，不挑成功样本或事后改阈值。
 

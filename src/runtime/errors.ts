@@ -65,6 +65,24 @@ export class BlueprintNotFound extends RoleRuntimeError {
   }
 }
 
+/** §6.4.1 导出净化断言命中的违规类别（镜像创建方向的 mesh 禁止字段，导出侧更易出错）。 */
+export type BlueprintExportViolation =
+  | "MESH_ACCOUNT_ID_PRESENT"
+  | "ENDPOINT_ID_PRESENT"
+  | "CONVERSATION_ID_PRESENT"
+  | "SEQ_OR_SEAL_PRESENT"
+  | "PEER_AGENT_ID_PRESENT"
+  | "PROMPT_VERSION_PRESENT";
+
+/** §6.4.1 assertExportable 失败：导出的蓝本携带 mesh 身份平面或同伴 agent id，不产出蓝本。 */
+export class BlueprintExportError extends RoleRuntimeError {
+  readonly violations: Array<{ code: BlueprintExportViolation; where: string }>;
+  constructor(violations: Array<{ code: BlueprintExportViolation; where: string }>, message: string) {
+    super(message);
+    this.violations = violations;
+  }
+}
+
 /**
  * 双库配对不成立（§18.2 / R33）：缺锚点、锚点标记不符、或 mesh 库被替换。此时所有
  * 跨库读取（恢复、成本重算、悬挂扫描）应整体拒绝出数，而不是给一个漏排除/误判的数。

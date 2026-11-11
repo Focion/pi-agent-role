@@ -32,6 +32,18 @@ export interface RoleMeshOptions {
   limits?: Partial<Limits>;
   /** 无 LLM 测试注入 FakeStreamPort；缺省 mesh 自建 PiStreamPort。 */
   streamPort?: StreamPort;
+  /**
+   * 多进程部署透传（O07 · §19.3，原样透传 createMesh，不复制通信运行时）：
+   *   · transport:"sameHost" ⇒ 用 SameHostTransport（同机多进程共享 DB-B，经 outbox 交叉投递）。
+   *   · transportOptions        ⇒ SameHostTransport 热轮询/租约参数。
+   *   · recoverDeadEndpoints    ⇒ 启动回收死写者遗留的实例/端点锁（§27.4，自动回收仅此一处）。
+   *   · busyTimeoutMs           ⇒ SQLite 写锁等待上限（多进程部署建议显式设置，§19.5）。
+   * 缺省全不传 ⇒ mesh 走 InProcessTransport + 单实例排他锁（单进程核心，行为不变）。
+   */
+  transport?: "sameHost";
+  transportOptions?: { pollIntervalMs?: number; claimTtlMs?: number; maxAttempts?: number };
+  recoverDeadEndpoints?: boolean;
+  busyTimeoutMs?: number;
   /** 会话后端；缺省 fake（无 LLM）。P1 换 createPiSessionFactory。 */
   backend?: SessionBackend;
   /** 逐账号领域工具处理器（P3 记忆：remember/recall 需按 owner 分区闭包；异步装配）。 */
@@ -141,6 +153,11 @@ export async function createRoleMesh(opts: RoleMeshOptions): Promise<RoleMesh> {
     limits: opts.limits,
     streamPort: opts.streamPort,
     policies,
+    // O07：多进程部署透传（缺省 undefined ⇒ mesh 走 InProcess + 单实例排他，行为不变）。
+    transport: opts.transport,
+    transportOptions: opts.transportOptions,
+    recoverDeadEndpoints: opts.recoverDeadEndpoints,
+    busyTimeoutMs: opts.busyTimeoutMs,
   });
 
   async function registerAgent(input: RegisterAgentInput): Promise<RegisteredAgentMeshIds> {

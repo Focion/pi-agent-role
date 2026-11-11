@@ -1,7 +1,10 @@
 ---
 title: pi-agent-role 实现差距核对与后续闭环计划
 date: 2026-10-09
-status: draft
+status: archived
+archived_date: 2026-11-02
+archived_from: notes/plan/2026-10-09-implementation-gap-closure-plan.md
+archived_reason: 被 notes/plan/2026-11-02-consolidated-audit-and-mesh-alignment-plan.md 接管
 owner: 待指定
 tags: [plan, implementation-gap, static-audit, role-agent]
 related:
@@ -11,6 +14,8 @@ related:
   - ../tech/2026-09-14-mesh-strategy-slot-signatures.md
   - ../review/README.md
 ---
+
+> **已归档（2026-11-02）**：本文档不再有效，请参见 `notes/plan/2026-11-02-consolidated-audit-and-mesh-alignment-plan.md`。
 
 ## 结论与计数口径
 

@@ -122,3 +122,41 @@ export function renderMemoryCard(input: RenderCardInput): string {
 export function renderMemoryBlocks(cards: string[]): string {
   return cards.join("\n\n");
 }
+
+/**
+ * §17.6 / Q09 教学进度里程碑的瞬时注入形态：`<<<PROGRESS … PROGRESS>>>`。
+ * 独立的 token 配额（RETRIEVAL_BUDGET.teachingProgress ≤200 / 3 条），不占 L1/L2/瞬时池；
+ * 只展示 gist + 绝对虚拟日标签（W3D1）——进度里程碑本就按「讲到哪里了」读，不做失真投影。
+ * budgetTokens 是硬上限，超出的低序项（candidates 已按虚拟时间倒序）直接截断。返回 null 无所注入。
+ */
+export function renderTeachingProgress(
+  candidates: Array<{ gist: string; virtualHours: number }>,
+  budgetTokens: number,
+): { text: string; tokens: number } | null {
+  if (candidates.length === 0) return null;
+  const header = "<<<PROGRESS\n[最近讲到哪里]\n";
+  const close = "PROGRESS>>>";
+  let budget = budgetTokens - estimateTokens(header) - estimateTokens(close);
+  if (budget <= 0) return null;
+
+  const dayLabel = (vh: number): string => {
+    // virtualHours 的虚拟日索引 m = week*7 + day（§8.1 的 minute 投影除以 24 再取整）。
+    const m = Math.floor(vh / 24);
+    const week = Math.floor((m - 1) / 7);
+    const day = ((m - 1) % 7) + 1;
+    return `W${week}D${day}`;
+  };
+
+  const lines: string[] = [];
+  for (const c of candidates) {
+    const line = `- [${dayLabel(c.virtualHours)}] ${c.gist}`;
+    const cost = estimateTokens(line + "\n");
+    if (budget < cost) break; // 硬上限截断
+    lines.push(line);
+    budget -= cost;
+  }
+  if (lines.length === 0) return null;
+
+  const text = `${header}${lines.join("\n")}\n${close}`;
+  return { text, tokens: budgetTokens - budget };
+}

@@ -211,6 +211,11 @@ export async function createRuntimeInternals(o: RuntimeOptions): Promise<Runtime
     devMode: o.devMode,
     limits: o.limits,
     streamPort: o.fake?.streamPort ? new FakeStreamPort() : undefined,
+    // O07：多进程部署透传（缺省 undefined ⇒ 单实例排他，行为不变）。
+    transport: o.mesh?.transport,
+    transportOptions: o.mesh?.transportOptions,
+    recoverDeadEndpoints: o.mesh?.recoverDeadEndpoints,
+    busyTimeoutMs: o.mesh?.busyTimeoutMs,
     seedRegistry: seed,
     floorState,
     registry,

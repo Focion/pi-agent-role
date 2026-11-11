@@ -97,6 +97,43 @@ export class KnowledgeService {
       }
     }
 
+    // §17.2 Q05：taught 是「教会别人」的最强证据，成立需双证据——① 讲者双主体情节（存在且
+    // owner=讲者，主体含 person:听者 + knowledge:topic）② 听者侧已迁移（≥understood 且
+    // taught_by=讲者）。①不齐则拒绝；②未落地则记 pending_taught，日终回补，本轮不成立 mastered。
+    if (plan.events !== "none" && final.to === "mastered" && kind === "taught") {
+      if (!p.evidenceEpisode) {
+        this.audit(owner, topic, "EVIDENCE_MISSING", existing, null, source);
+        return { ok: false, reason: "EVIDENCE_MISSING" };
+      }
+      const subjects = this.dao.episodeSubjects(p.evidenceEpisode);
+      const knowledgeHit = subjects.some((s) => s.type === "knowledge" && s.id === topic);
+      const listener = subjects.find((s) => s.type === "person");
+      if (!knowledgeHit || !listener) {
+        this.audit(owner, topic, "EVIDENCE_MISSING", existing, null, source);
+        return { ok: false, reason: "EVIDENCE_MISSING" };
+      }
+      const listenerRef = serializeSubjectRef({ type: "person", id: listener.id });
+      const speakerRef = serializeSubjectRef({ type: "person", id: owner });
+      if (!this.dao.listenerProgress(listener.id, topic, speakerRef)) {
+        // 讲者先记 pending，等听者迁移后由日终回补（§17.2）；本轮保持 applied，不写 taught 事件。
+        const pendingId = newId("pt");
+        this.dao.insertPendingTaught({
+          pendingId,
+          ownerAgent: owner,
+          knId,
+          topic,
+          listenerRef,
+          evidence: p.evidence?.slice(0, 400) ?? null,
+          episodeId: p.evidenceEpisode,
+          virtualTs: source.virtualTs,
+          virtualHours,
+        });
+        this.audit(owner, topic, null, existing, final.to, source);
+        const pendingFrom: Mastery = existing?.mastery ?? "applied";
+        return { ok: true, knId, from: pendingFrom, to: pendingFrom, eventIds: [], practiced: false, taughtPending: { pendingId, listener: listenerRef } };
+      }
+    }
+
     // 构造事件链。T5 跳级补中间 understood 事件（§17.1.2）。
     const events: KnowledgeEventWrite[] = [];
     if (plan.events === "skip") {
@@ -174,6 +211,47 @@ export class KnowledgeService {
     return this.dao.decay(owner, virtualHours, tau0Hours);
   }
 
+  /**
+   * 日终回补（§17.2 Q05「日终回补」）：扫讲者的 open pending_taught，听者一旦迁移到
+   * ≥understood 且归因讲者，就把 pending 的 `taught` 证据落地为 mastered 成立（写一条
+   * taught 事件 + 升 mastered）。已 mastered 的幂等跳过、不重复写事件；畸行/非法听者标
+   * rejected。返回本轮确认条数。跨分区读只在服务层发生，Agent 只拿到成立与否。
+   */
+  backfillPendingTaught(owner: string, opts?: { virtualTs?: string; virtualHours?: number }): number {
+    let confirmed = 0;
+    const speakerRef = serializeSubjectRef({ type: "person", id: owner });
+    for (const p of this.dao.openPendingTaught(owner)) {
+      let listenerId: string;
+      try {
+        const ref = parseSubjectRef(p.listenerRef);
+        listenerId = ref.type === "person" ? ref.id : "";
+      } catch {
+        listenerId = "";
+      }
+      if (listenerId === "") {
+        this.dao.markPendingSettled(p.pendingId, "rejected");
+        continue;
+      }
+      if (!this.dao.listenerProgress(listenerId, p.topic, speakerRef)) continue; // 听者未迁移，等下一个日终。
+      const item = this.dao.item(owner, p.topic);
+      if (item && item.mastery === "applied") {
+        this.dao.applyTaughtPromotion({
+          evId: newId("ke"),
+          knId: p.knId,
+          owner,
+          from: "applied",
+          evidence: p.evidence,
+          episodeId: p.episodeId,
+          virtualTs: opts?.virtualTs ?? p.virtualTs,
+          virtualHours: opts?.virtualHours ?? p.virtualHours,
+        });
+      }
+      this.dao.markPendingSettled(p.pendingId, "resolved");
+      confirmed += 1;
+    }
+    return confirmed;
+  }
+
   /** 供反射输入的掌握度摘要（§13.4.1 knowledgeSummary）。 */
   summary(owner: string): string {
     return this.dao.knowledgeSummary(owner);
@@ -185,26 +263,43 @@ export class KnowledgeService {
   }
 
   /**
-   * 学习队列整理（§17.5.2 Q1/Q3/Q4）。入参 `proposed` 是本次自省模型给出的新意图，
+   * 学习队列整理（§17.5.2 Q1/Q2/Q3/Q4）。入参 `proposed` 是本次自省模型给出的新意图，
    * 返回整理后的队列（去重、按优先级排序、封顶 7）。
    *   · Q4：is_misconception=1 的 topic 自动入队（priority=high，motivation 写系统模糊语，
    *     绝不把 wrong_belief 文本带入——否则误区会自我消解）；
    *   · A34：继承上一轮队列（模型省略 learningQueue 时，未完成的非误区项不消失）；
    *   · Q1：mastery 已达 applied+ 且非误区的 topic 出队（A33：仍有误区的 applied/mastered
    *     项保持 high，不因掌握度高而连带出队）；
-   *   · Q3：上限 7，稳定排序后从尾部（low 优先）淘汰；
-   *   · Q2：连续 3 个虚拟日未触及 ⇒ 降档——需场景「触及时刻」的虚拟时钟，属 §15.5 日终
-   *     任务（尚未搭建），此处不实现（残留）。
+   *   · Q2：连续 3 个虚拟日未被任何场景触及 ⇒ priority 降一档；降到 low 之下则出队。
+   *     「触及」= 该 topic 的 knowledge_items.last_practiced_vhours，或入队虚拟小时
+   *     （后者对尚无 knowledge 行的 unseen 意图起算）。仅当 opts.virtualHours 提供
+   *     （日终任务，§15.5）时执行——非日终的自省应用不触发降档。
+   *   · Q3：上限 7，稳定排序后从尾部（low 优先）淘汰。
    */
-  organizeLearningQueue(owner: string, proposed: LearningQueueItem[]): LearningQueueItem[] {
+  organizeLearningQueue(owner: string, proposed: LearningQueueItem[], opts?: { virtualHours?: number }): LearningQueueItem[] {
     const items = this.dao.listItems(owner);
     const mastery = new Map(items.map((i) => [i.topic, i.mastery]));
+    const practiced = new Map(items.map((i) => [i.topic, i.lastPracticedVhours]));
     const misconceptions = new Set(items.filter((i) => i.isMisconception === 1).map((i) => i.topic));
+    const nowHours = opts?.virtualHours;
 
     const byTopic = new Map<string, LearningQueueItem>();
+    // 合并：topic 首次出现直接放；再次出现只在优先级更高时覆盖 priority/motivation，
+    // enqueuedVhours 保留最早那一次（「入队」起算一次，不因反复重提而重置）。
+    const merge = (item: LearningQueueItem): void => {
+      const cur = byTopic.get(item.topic);
+      if (!cur) {
+        byTopic.set(item.topic, item);
+        return;
+      }
+      if (PRIORITY_RANK[item.priority] > PRIORITY_RANK[cur.priority]) {
+        byTopic.set(item.topic, { ...item, enqueuedVhours: cur.enqueuedVhours ?? item.enqueuedVhours });
+      }
+    };
+
     // Q4：误区自动入队。
     for (const topic of misconceptions) {
-      byTopic.set(topic, { topic, priority: "high", motivation: "我好像哪里没搞对" });
+      merge({ topic, priority: "high", motivation: "我好像哪里没搞对", ...(nowHours !== undefined ? { enqueuedVhours: nowHours } : {}) });
     }
     // A34：继承上一轮队列（优先级较低的「待办」不因本轮模型省略而丢失）。
     for (const raw of this.dao.lastLearningQueue(owner)) {
@@ -213,10 +308,12 @@ export class KnowledgeService {
       const priority: LearningQueueItem["priority"] =
         raw.priority === "high" || raw.priority === "medium" || raw.priority === "low" ? raw.priority : "medium";
       const motivation = typeof raw.motivation === "string" ? raw.motivation.slice(0, 200) : "";
-      const cur = byTopic.get(topic);
-      if (!cur || PRIORITY_RANK[priority] > PRIORITY_RANK[cur.priority]) {
-        byTopic.set(topic, { topic, priority, motivation });
-      }
+      merge({
+        topic,
+        priority,
+        motivation,
+        ...(raw.enqueuedVhours !== undefined ? { enqueuedVhours: raw.enqueuedVhours } : {}),
+      });
     }
     // 合并模型提议（同 topic 保留更高优先级；Q4 的 high 优先于模型的 medium/low）。
     for (const raw of proposed) {
@@ -225,15 +322,23 @@ export class KnowledgeService {
       const priority: LearningQueueItem["priority"] =
         raw?.priority === "high" || raw?.priority === "medium" || raw?.priority === "low" ? raw.priority : "medium";
       const motivation = typeof raw?.motivation === "string" ? raw.motivation.slice(0, 200) : "";
-      const cur = byTopic.get(topic);
-      if (!cur || PRIORITY_RANK[priority] > PRIORITY_RANK[cur.priority]) {
-        byTopic.set(topic, { topic, priority, motivation });
-      }
+      merge({ topic, priority, motivation, ...(nowHours !== undefined ? { enqueuedVhours: nowHours } : {}) });
     }
     // Q1：已掌握到 applied+ 且非误区（A33）的自动出队。
     for (const topic of byTopic.keys()) {
       const m = mastery.get(topic);
       if ((m === "applied" || m === "mastered") && !misconceptions.has(topic)) byTopic.delete(topic);
+    }
+    // Q2：连续 3 虚拟日未触及 ⇒ 降档 / 出队（仅日终）。
+    if (nowHours !== undefined) {
+      for (const [topic, item] of [...byTopic]) {
+        const lastTouch = Math.max(item.enqueuedVhours ?? nowHours, practiced.get(topic) ?? Number.NEGATIVE_INFINITY);
+        const untouchedDays = Math.floor((nowHours - lastTouch) / 24);
+        if (untouchedDays < 3) continue;
+        if (item.priority === "high") item.priority = "medium";
+        else if (item.priority === "medium") item.priority = "low";
+        else byTopic.delete(topic);
+      }
     }
     // Q3：稳定排序（高优先在前），封顶 7，从尾部淘汰 low。
     return [...byTopic.values()]

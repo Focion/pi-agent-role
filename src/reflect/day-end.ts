@@ -144,10 +144,13 @@ export class DayEndService {
       reflectionResult = { agentId, trigger: "scene_end", depth: "light", sent: false, skipped: `day-end reflection failed: ${msg}` };
       degraded.push(`reflection failed: ${msg}`);
     }
+    // ②.5 pending_taught 回补（§17.2 Q05）：必须**先于** ③ 知识衰减——刚被确认「讲对了」
+    // 而升到 mastered 的条目不因同次日终按旧 mastery 衰减（S5 状态迁移先于衰减）。
+    const taughtBackfilled = this.knowledge.backfillPendingTaught(agentId, { virtualTs, virtualHours });
     // ③ 知识衰减。
     const kd = this.knowledge.decay(agentId, virtualHours, policy.tau0Hours);
-    // ④ 学习队列整理（无新模型意图，继承 + 出队已掌握项 + 封顶 7）。
-    const queue = this.knowledge.organizeLearningQueue(agentId, []);
+    // ④ 学习队列整理（无新模型意图，继承 + 出队已掌握项 + 封顶 7；Q2 三日降档在日终执行）。
+    const queue = this.knowledge.organizeLearningQueue(agentId, [], { virtualHours });
 
     if (!reflectionResult.sent && reflectionResult.depth === "full") {
       degraded.push(reflectionResult.skipped ?? "reflection cue not sent");
@@ -159,6 +162,7 @@ export class DayEndService {
       virtualTs,
       memoryDecayed: sweep.scanned,
       knowledgeDecayed: kd.scanned,
+      taughtBackfilled,
       queueConsolidated: queue.length,
       degraded,
       finishedAt: new Date().toISOString(),

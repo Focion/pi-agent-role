@@ -1,7 +1,10 @@
 ---
 title: pi-agent-role 0.1.0 核心闭环与私有发布落地计划
 date: 2026-10-09
-status: draft
+status: archived
+archived_date: 2026-11-02
+archived_from: notes/plan/2026-10-09-v0-1-0-release-implementation-plan.md
+archived_reason: 被 notes/plan/2026-11-02-consolidated-audit-and-mesh-alignment-plan.md 接管
 owner: 待指定
 tags: [plan, release, v0.1.0, implementation, role-differentiation]
 related:
@@ -11,6 +14,8 @@ related:
   - ../tech/ROLE-AGENT-DESIGN.md
   - ../tech/2026-09-14-mesh-strategy-slot-signatures.md
 ---
+
+> **已归档（2026-11-02）**：本文档不再有效，请参见 `notes/plan/2026-11-02-consolidated-audit-and-mesh-alignment-plan.md`。
 
 ## 目标与授权边界
 

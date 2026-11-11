@@ -652,8 +652,10 @@ export class ReflectionService {
       }
     }
 
-    // ⑤ 学习队列整理（§17.5.2 Q4/Q1/Q3）：模型提议 + 误区自动入队 → 存 output_json。
-    output.learningQueue = this.knowledge.organizeLearningQueue(owner, output.learningQueue ?? []);
+    // ⑤ 学习队列整理（§17.5.2 Q4/Q1/Q3 + Q2 时间戳）：模型提议 + 误区自动入队 → 存 output_json。
+    output.learningQueue = this.knowledge.organizeLearningQueue(owner, output.learningQueue ?? [], {
+      virtualHours: flight.virtualHours,
+    });
 
     // R17 旧问题连续：未澄清问题规整为短文本数组（过滤非法、限条数/长度），随 output_json
     // 持久化供下一轮 lastOpenQuestions 读回重注入 cue，连续自省不丢未解决问题与意图。

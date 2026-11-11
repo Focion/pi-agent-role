@@ -35,11 +35,14 @@ import type { KnowledgeService } from "../knowledge/service.js";
 import type { ProjectedMeshIds, RegisterProjectionInput, RegisterReflectInput } from "../mesh/bootstrap.js";
 import { BlueprintNotFound, SpecVersionMismatch, ValidationError } from "./errors.js";
 import { reconcile, reproject } from "./projector.js";
+import { exportAsBlueprint } from "./export-blueprint.js";
 import type {
   CreateAgentInput,
   CreateAgentResult,
   CreateBatchItemResult,
   DeleteAgentResult,
+  ExportAsBlueprintInput,
+  ExportAsBlueprintResult,
   ReconcileRegistrationResult,
   RespecResult,
   RestoreResult,
@@ -654,6 +657,7 @@ export function makeAgentApi(
   retire(agentId: string): RetireResult;
   restore(agentId: string): RestoreResult;
   deleteAgent(agentId: string): DeleteAgentResult;
+  exportAsBlueprint(input: ExportAsBlueprintInput): Promise<ExportAsBlueprintResult>;
 } {
   const doCreate = async (input: CreateAgentInput): Promise<CreateAgentResult> => {
     const { result, spec } = await runCreate(input, deps);
@@ -711,6 +715,9 @@ export function makeAgentApi(
     },
     deleteAgent(agentId: string): DeleteAgentResult {
       return runDeleteAgent(agentId, deps);
+    },
+    exportAsBlueprint(input: ExportAsBlueprintInput): Promise<ExportAsBlueprintResult> {
+      return exportAsBlueprint(deps.roleDb, deps.root, input);
     },
   };
 }

@@ -43,6 +43,7 @@ function candidate(id: string, extra: Partial<EpisodeCandidate> = {}): EpisodeCa
     retention: 0.5,
     status: "active",
     bm25: -1.0,
+    relevance: 1.0,
     ...extra,
   };
 }

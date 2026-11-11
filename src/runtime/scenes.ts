@@ -11,7 +11,7 @@
 // ═══════════════════════════════════════════════════════════════════════════
 
 import type { RoleAccountRegistry } from "../mesh/accounts.js";
-import type { SceneEstablished, SceneOrchestrator, SceneRunResult, SceneSpec } from "../scene/types.js";
+import type { SceneEstablished, SceneInjection, SceneInjectionInput, SceneOrchestrator, SceneRunResult, SceneSpec } from "../scene/types.js";
 import { ValidationError } from "./errors.js";
 import type { CreateSceneInput, SceneApi, SceneRunOptions } from "./types.js";
 
@@ -39,6 +39,7 @@ export function makeSceneApi(deps: SceneApiDeps): SceneApi {
       virtualStart: input.virtualStart,
       turnDurationMinutes: input.turnDurationMinutes,
       floorMode: input.floorMode,
+      script: input.script,
       maxTurns: input.maxTurns,
       tokenBudget: input.tokenBudget,
       facilityId: input.facilityId,
@@ -55,6 +56,12 @@ export function makeSceneApi(deps: SceneApiDeps): SceneApi {
     },
     resume(sceneId: string, signal?: AbortSignal, opts?: SceneRunOptions): Promise<SceneRunResult> {
       return orchestrator.resume(sceneId, { signal, maxTurns: opts?.maxTurns, tokenBudget: opts?.tokenBudget });
+    },
+    pause(sceneId: string): Promise<SceneRunResult> {
+      return orchestrator.pause(sceneId);
+    },
+    inject(input: SceneInjectionInput): Promise<SceneInjection> {
+      return orchestrator.inject(input);
     },
     close(sceneId: string): Promise<SceneRunResult> {
       return orchestrator.close(sceneId);

@@ -10,6 +10,7 @@
 
 import type { MeshToolResult } from "../mesh/public-types.js";
 import type { ToolExecute } from "../mesh/tools.js";
+import { Fts5Backend, type RetrievalBackend } from "./backend.js";
 import type { EpisodeWrite, MemoryDao } from "./dao.js";
 import { RECALL_QUOTA, WRITE } from "./constants.js";
 import { normalizeAssignablePurpose, SALIENCE_FLOOR_BY_KIND, TEACHING_PROGRESS_DUP_WINDOW } from "./purpose.js";
@@ -48,6 +49,8 @@ export interface MemoryToolDeps {
   labelOf?: (ref: SubjectRef) => string;
   /** R31 内部健康保护：fail-closed 时返回 false，remember/note_self 拒写。缺省放行。 */
   writesAllowed?: () => boolean;
+  /** O03 可替换检索后端（recall 路径；缺省 FTS5）。 */
+  backend?: RetrievalBackend;
 }
 
 /** 结构化工具错误（§12.3 失败语义）；code 复用 mesh 既有码。 */
@@ -214,6 +217,7 @@ function makeRemember(deps: MemoryToolDeps): ToolExecute {
 }
 
 function makeRecall(deps: MemoryToolDeps): ToolExecute {
+  const backend = deps.backend ?? new Fts5Backend(deps.dao);
   return async (_toolCallId, params) => {
     const query = params.query;
     if (typeof query !== "string" || query.trim().length === 0) {
@@ -235,7 +239,7 @@ function makeRecall(deps: MemoryToolDeps): ToolExecute {
 
     const trimmed = query.trim();
     const limit = clampRecallLimit(params.limit);
-    const candidates = deps.dao.searchCandidates(deps.ownerAgent, trimmed, true);
+    const candidates = backend.searchCandidates({ owner: deps.ownerAgent, query: trimmed, includeFaded: true });
     const subjectsByEpisode = deps.dao.subjectsOf(
       deps.ownerAgent,
       candidates.map((c) => c.episodeId),
@@ -262,12 +266,13 @@ function makeRecall(deps: MemoryToolDeps): ToolExecute {
       sceneId: turn.sceneId,
       turn: turn.turn,
       triggerMsgId: null,
-      queryJson: JSON.stringify({ query: trimmed, channel: "recall" }),
+      queryJson: JSON.stringify({ query: trimmed, channel: "recall", backend: backend.id }),
       candidates: candidates.length,
       selectedJson: JSON.stringify(selected.selectedIds),
       tokensL2: 0,
       tokensL1: selected.tokens,
       tokensTransient: 0,
+      tokensPurpose: 0,
       tokensTotal: selected.tokens,
       clamped: selected.clamped,
       renderedCard: cardsText,

@@ -245,6 +245,7 @@ describe("model_config_hash 写入（§5.4 E09）", () => {
         tokensL2: 0,
         tokensL1: 0,
         tokensTransient: 0,
+        tokensPurpose: 0,
         tokensTotal: 0,
         clamped: 1,
         renderedCard: "card",

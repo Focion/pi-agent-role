@@ -284,10 +284,8 @@ interface Projection {
 
 function computeProjection(db: Database.Database, agentId: string, identityDir: string): Projection {
   const state = readState(db, agentId);
-  const knowledge = knowledgeRows(db, agentId);
-  const persons = loadPersons(db, agentId);
+  const growth = computeGrowthProjection(db, agentId);
   const subjects = loadSubjects(db, agentId);
-  const reflections = loadReflections(db, agentId);
   const episodes = loadEpisodes(db, agentId);
 
   // evolution.yaml 是冷启动文件：保留模板静态键，只回写运行期持有的状态键。
@@ -295,10 +293,10 @@ function computeProjection(db: Database.Database, agentId: string, identityDir: 
 
   const templates = new Map<string, string>();
   templates.set("evolution.yaml", stringifyYaml(renderEvolution(state, existingEvolution)));
-  templates.set("skills.yaml", stringifyYaml(renderSkills(knowledge)));
-  templates.set("specialties.yaml", stringifyYaml(renderSpecialties(knowledge)));
-  templates.set("social.yaml", stringifyYaml(renderSocial(persons)));
-  templates.set("shadow.yaml", stringifyYaml(renderShadow(reflections)));
+  templates.set("skills.yaml", stringifyYaml(growth.skills));
+  templates.set("specialties.yaml", stringifyYaml(growth.specialties));
+  templates.set("social.yaml", stringifyYaml(growth.social));
+  templates.set("shadow.yaml", stringifyYaml(growth.shadow));
 
   const memories = new Map<string, string>();
   memories.set("short_term.md", renderShortTerm(episodes));
@@ -308,6 +306,25 @@ function computeProjection(db: Database.Database, agentId: string, identityDir: 
   }
 
   return { templates, memories };
+}
+
+/** §6.4：四个 growth 可写文件的对象形式（不落盘），供 exportAsBlueprint 复用与脱敏。 */
+export interface GrowthProjection {
+  skills: Record<string, unknown>;
+  specialties: Record<string, unknown>;
+  social: Record<string, unknown>;
+  shadow: Record<string, unknown>;
+}
+
+/** 渲染 §6.2 的四个 growth 投影为对象（不触碰 evolution，它在导出时被丢弃）。 */
+export function computeGrowthProjection(db: Database.Database, agentId: string): GrowthProjection {
+  const knowledge = knowledgeRows(db, agentId);
+  return {
+    skills: renderSkills(knowledge),
+    specialties: renderSpecialties(knowledge),
+    social: renderSocial(loadPersons(db, agentId)),
+    shadow: renderShadow(loadReflections(db, agentId)),
+  };
 }
 
 /** 读取既有 evolution.yaml（可能含蓝图静态键）；不存在或坏文件返回 {}。 */

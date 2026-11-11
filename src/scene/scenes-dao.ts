@@ -11,7 +11,7 @@
 import type Database from "better-sqlite3";
 
 import { ValidationError } from "../runtime/errors.js";
-import type { NewSceneInput, SceneParticipant, SceneRow, SceneStatus, SceneStore } from "./types.js";
+import type { NewSceneInput, SceneInjection, SceneParticipant, SceneRow, SceneStatus, SceneStore } from "./types.js";
 
 /** scenes 表物理行（snake_case，与 001_init.sql 逐列对应）。 */
 interface SceneDbRow {
@@ -152,6 +152,50 @@ export class ScenesDao implements SceneStore {
   /** 结束/中止：写 status + ended_at。 */
   end(sceneId: string, status: Extract<SceneStatus, "ended" | "aborted">, endedAt: string): void {
     this.db.prepare(`UPDATE scenes SET status = ?, ended_at = ? WHERE scene_id = ?`).run(status, endedAt, sceneId);
+  }
+
+  /** 暂停：active→paused（条件写，已非 active 则 0 行生效）。 */
+  pause(sceneId: string): boolean {
+    const info = this.db.prepare(`UPDATE scenes SET status = 'paused' WHERE scene_id = ? AND status = 'active'`).run(sceneId);
+    return info.changes > 0;
+  }
+
+  /** 恢复：paused→active（条件写，非 paused 则 0 行生效）。 */
+  unpause(sceneId: string): boolean {
+    const info = this.db.prepare(`UPDATE scenes SET status = 'active' WHERE scene_id = ? AND status = 'paused'`).run(sceneId);
+    return info.changes > 0;
+  }
+
+  /** 记一笔场景注入（injectId 幂等键；冲突时按数据库唯一约束抛出，由编曲器先查后插）。 */
+  recordInjection(inj: SceneInjection): void {
+    this.db
+      .prepare(
+        `INSERT INTO scene_injections (inject_id, scene_id, conversation_id, message_id, from_account, msg_class, text, virtual_ts, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(inj.injectId, inj.sceneId, inj.conversationId, inj.messageId, inj.fromAccount, inj.msgClass, inj.text, inj.virtualTs, inj.createdAt);
+  }
+
+  /** 按幂等键回读注入。 */
+  getInjection(injectId: string): SceneInjection | undefined {
+    const r = this.db
+      .prepare(`SELECT inject_id, scene_id, conversation_id, message_id, from_account, msg_class, text, virtual_ts, created_at FROM scene_injections WHERE inject_id = ?`)
+      .get(injectId) as
+      | { inject_id: string; scene_id: string; conversation_id: string; message_id: string; from_account: string; msg_class: string; text: string; virtual_ts: string | null; created_at: string }
+      | undefined;
+    return r
+      ? {
+          injectId: r.inject_id,
+          sceneId: r.scene_id,
+          conversationId: r.conversation_id,
+          messageId: r.message_id,
+          fromAccount: r.from_account,
+          msgClass: r.msg_class,
+          text: r.text,
+          virtualTs: r.virtual_ts,
+          createdAt: r.created_at,
+        }
+      : undefined;
   }
 
   /** 活跃场景列表（resume 后自检 / 巡检用）。 */

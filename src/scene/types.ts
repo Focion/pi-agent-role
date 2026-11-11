@@ -17,8 +17,8 @@ import type { UsageBreakdown } from "../mesh/pi-backend.js";
 import type { CostRecord } from "../runtime/types.js";
 import type { SceneExtRegistry } from "./ext-registry.js";
 
-/** 场景状态机（§7.5 四段 + aborted）。DB 缺省 'active' = 运行中。 */
-export type SceneStatus = "active" | "ended" | "aborted";
+/** 场景状态机（§7.5 四段 + aborted + paused）。DB 缺省 'active' = 运行中。 */
+export type SceneStatus = "active" | "paused" | "ended" | "aborted";
 
 /** 参与者在场景内的领域角色（§3.3 表 + §7.1）。旁听/观察者只有 read、无 speak。 */
 export type SceneParticipantRole = "host" | "teacher" | "student" | "facility" | "observer";
@@ -37,6 +37,30 @@ export interface SceneParticipant {
 
 /** 发言权模式（scenes.floor_mode / §7.2）。mesh 内建只有 free_for_all，其余本环实现。 */
 export type FloorMode = "free_for_all" | "round_robin" | "director" | "reactive";
+
+/**
+ * 导演剧本的一步（O02）：按顺序点名。`target` 是场景参与者的 agentId 或领域角色名
+ * （角色名匹配第一个该角色参与者，顺序无关——「叫第一个学生」这类条件）。
+ */
+export interface DirectorStep {
+  /** 点名目标：agentId 或角色名（host/teacher/student/facility/observer）。 */
+  target: string;
+  /** 本条点名的 cue 正文；缺省用编曲器默认「【点名】…」。 */
+  text?: string;
+}
+
+/**
+ * 完整导演剧本（O02）：显式有序脚本，替代 director 模式的默认轮转。
+ *   顺序 = steps 依序执行；条件 = target 可角色名解析 + 逐步资格校验（observer/缺失 skip）；
+ *   恢复位置 = 绝对轮次（turn_count）对 steps 取模/截断，resume 从停点无损续上；
+ *   失败边界 = 建场景时校验每个 target 可解析到非 observer 参与者（否则 ValidationError），
+ *   非 loop 播完 → stopReason="idle"。
+ */
+export interface DirectorScript {
+  steps: DirectorStep[];
+  /** 播完回绕（缺省 false：播完即 idle）。 */
+  loop?: boolean;
+}
 
 /** scenes 表一行（§18.3 DDL）。participants 反序列化后是 SceneParticipant[]。 */
 export interface SceneRow {
@@ -77,6 +101,8 @@ export interface SceneSpec {
   turnDurationMinutes?: number;
   /** 发言权模式。默认 'director'（只有被点名者能说，§7.2 表）。 */
   floorMode?: FloorMode;
+  /** director 模式的完整剧本（O02）；缺省则 director 退化为基础轮转。 */
+  script?: DirectorScript;
   /** 场景轮次预算（领域预算，mesh Limits 无此概念，§7.6）。超限熔断。 */
   maxTurns?: number;
   /** 场景 token 预算（§7.6）。 */
@@ -88,7 +114,7 @@ export interface SceneSpec {
 /** 场景运行结果（§P2 验收 7：abort 无损、stopReason 精确）。 */
 export interface SceneRunResult {
   sceneId: string;
-  stopReason: "max_turns" | "budget" | "aborted" | "closed" | "idle";
+  stopReason: "max_turns" | "budget" | "aborted" | "closed" | "paused" | "idle";
   turnsCompleted: number;
   /** 本次 run 消耗的 token（不持久；run 临时收窄上限据此判定，R13/E02）。 */
   tokensThisRun: number;
@@ -239,6 +265,34 @@ export interface SceneEstablished {
 }
 
 /**
+ * 场景注入（O05）：宿主往运行中的场景注入一条旁白/事件消息（kind:"system" +
+ * msgClass:"narration"）的审计 + 幂等记录。injectId 是客户端幂等键——重试/崩溃恢复
+ * 按它去重，不重复发消息。
+ */
+export interface SceneInjectionInput {
+  sceneId: string;
+  /** 客户端幂等键；同键重试幂等返回原注入。 */
+  injectId: string;
+  /** 旁白正文。 */
+  text: string;
+  /** 归属账号：必须是被授权发 system 的 host（缺省退场景 host / deps.host / @system）。 */
+  from?: AccountId;
+}
+
+/** scene_injections 表投影。 */
+export interface SceneInjection {
+  injectId: string;
+  sceneId: string;
+  conversationId: string;
+  messageId: string;
+  fromAccount: AccountId;
+  msgClass: string;
+  text: string;
+  virtualTs: string | null;
+  createdAt: string;
+}
+
+/**
  * 场景编曲器（P2 · §7）。runtime 门面把「agentId/角色」解析成 meshAccountId 后，
  * 交给本接口的 create()；run/resume 驱动点名循环直到预算/超时/abort。
  */
@@ -247,8 +301,12 @@ export interface SceneOrchestrator {
   create(spec: SceneSpec): Promise<SceneEstablished>;
   /** 跑一轮（§7.5）：点名 → 发 cue → 推进虚拟时钟 → 预算熔断；abort（H04）只停新 cue。 */
   run(sceneId: string, opts?: RunOptions): Promise<SceneRunResult>;
-  /** 恢复一个仍在 active 的场景接着跑（读 scenes 行，不重建会话成员）。 */
+  /** 恢复一个仍在 active/paused 的场景接着跑（读 scenes 行，不重建会话成员）。 */
   resume(sceneId: string, opts?: RunOptions): Promise<SceneRunResult>;
+  /** 暂停（O04）：status→'paused'，持久化；不解散会话、不跑日终；resume 从停点无损续上。 */
+  pause(sceneId: string): Promise<SceneRunResult>;
+  /** 注入（O05）：往运行中场景发一条旁白（narration），授权/归属/审计/幂等恢复。 */
+  inject(input: SceneInjectionInput): Promise<SceneInjection>;
   /** 收尾（§7.5）：status='ended'，落 ended_at，不解散会话（一个会话可乘多周次）。 */
   close(sceneId: string): Promise<SceneRunResult>;
   /** 读当前行（host 自检 / resume 前判断）。 */
@@ -283,6 +341,14 @@ export interface SceneStore {
   getByConversation(conversationId: ConversationId): SceneRow | undefined;
   advance(sceneId: string, virtualNow: string, deltaTokens: number): { turnCount: number; tokenSpent: number; changed: boolean };
   end(sceneId: string, status: Extract<SceneStatus, "ended" | "aborted">, endedAt: string): void;
+  /** 暂停：active→paused；返回是否确实发生翻转（已 ended/aborted/paused 或不存在则 false）。 */
+  pause(sceneId: string): boolean;
+  /** 恢复：paused→active；返回是否确实发生翻转。 */
+  unpause(sceneId: string): boolean;
+  /** 记一笔注入（幂等键 injectId）。 */
+  recordInjection(inj: SceneInjection): void;
+  /** 按幂等键回读注入（不存在返回 undefined）。 */
+  getInjection(injectId: string): SceneInjection | undefined;
   listActive(): SceneRow[];
 }
 

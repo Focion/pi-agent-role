@@ -28,7 +28,8 @@ import { newId } from "../runtime/id.js";
 import { parseVirtualTs, virtualHoursOf } from "../runtime/virtual-clock.js";
 import { OBSERVATION_CONFIDENCE, RETRIEVAL_BUDGET, WRITE } from "./constants.js";
 import type { EpisodeCandidate, MemoryDao } from "./dao.js";
-import { estimateTokens, renderMemoryBlocks } from "./render.js";
+import { Fts5Backend, type RetrievalBackend } from "./backend.js";
+import { estimateTokens, renderMemoryBlocks, renderTeachingProgress } from "./render.js";
 import {
   makeRankedCardRenderer,
   rankCandidatesWithSubjects,
@@ -105,6 +106,8 @@ export interface MemoryServiceDeps {
   /** R31 内部健康保护：fail-closed 时（invariant 违反 / accessControl 降级）返回 false，
    *  记忆写入（情节 / 判定 / 观察）一律停写。缺省恒 true（无健康哨兵）。 */
   writesAllowed?: () => boolean;
+  /** O03 可替换检索后端（缺省 FTS5）。向量后端在此注入，自动注入与 recall 共用。 */
+  backend?: RetrievalBackend;
 }
 
 export class MemoryService {
@@ -114,6 +117,8 @@ export class MemoryService {
   private readonly policyOf: (accountId: string) => Promise<MemoryPolicy | undefined>;
   /** R31 内部健康保护：fail-closed 停写门（缺省放行）。 */
   private readonly writesAllowed: () => boolean;
+  /** O03 可替换检索后端（缺省 FTS5）。 */
+  private readonly backend: RetrievalBackend;
 
   /** accountId → 当前活动轮（一个 owner 一轮；message_consumed 结算清除）。 */
   private readonly turns = new Map<string, TurnState>();
@@ -131,6 +136,7 @@ export class MemoryService {
     this.knowledge = deps.knowledge;
     this.policyOf = deps.policyOf;
     this.writesAllowed = deps.writesAllowed ?? (() => true);
+    this.backend = deps.backend ?? new Fts5Backend(deps.dao);
   }
 
   // ─── 装配 ────────────────────────────────────────────────────────────────
@@ -180,21 +186,27 @@ export class MemoryService {
         Math.max(0, RETRIEVAL_BUDGET.transient - (stateCard?.tokens ?? 0)),
       );
 
+      // ── 教学进度（§17.6 / Q09）：最近教学里程碑，独立配额 ≤200 / 3 条（不占 L1/L2/瞬时）。 ──
+      const progressCandidates = self.dao.recentByPurpose(turn.ownerAgent, "teaching_progress");
+      const progressCard = renderTeachingProgress(progressCandidates, RETRIEVAL_BUDGET.teachingProgress);
+
       const hasL2 = l2Card !== null;
       const hasMemory = (r?.cards?.length ?? 0) > 0;
       const hasTransient = stateCard !== null || lqCard !== null;
+      const hasPurpose = progressCard !== null;
 
-      // 三层皆空 → 无注入（no-op，不写 retrieval_log、不返回额外 messages）。
-      if (!hasL2 && !hasMemory && !hasTransient) return undefined;
+      // 四层皆空 → 无注入（no-op，不写 retrieval_log、不返回额外 messages）。
+      if (!hasL2 && !hasMemory && !hasTransient && !hasPurpose) return undefined;
 
       const l2Tokens = l2Card?.tokens ?? 0;
       const l1Tokens = r?.tokensL1 ?? 0;
       const transientTokens = (stateCard?.tokens ?? 0) + (lqCard?.tokens ?? 0);
+      const purposeTokens = progressCard?.tokens ?? 0;
 
       // 幂等（§18.4.4 上下文钩子每个 LLM 调用都会重跑）：同一 trigger_msg 只落一次
       // retrieval_log + 强化一次。hasRetrievalFor 是这个副作用的守门。
       if (turn.sourceMsgId && !self.dao.hasRetrievalFor(turn.ownerAgent, turn.sourceMsgId)) {
-        const combinedText = [l2Card?.text ?? "", r?.cardsText ?? "", stateCard?.text ?? "", lqCard?.text ?? ""]
+        const combinedText = [l2Card?.text ?? "", r?.cardsText ?? "", stateCard?.text ?? "", lqCard?.text ?? "", progressCard?.text ?? ""]
           .filter(Boolean)
           .join("\n\n");
         self.dao.insertRetrievalLog({
@@ -208,7 +220,8 @@ export class MemoryService {
           tokensL2: l2Tokens,
           tokensL1: l1Tokens,
           tokensTransient: transientTokens,
-          tokensTotal: l2Tokens + l1Tokens + transientTokens,
+          tokensPurpose: purposeTokens,
+          tokensTotal: l2Tokens + l1Tokens + transientTokens + purposeTokens,
           clamped: r?.clamped ?? 0,
           renderedCard: combinedText,
           cardSha256: sha256Hex(combinedText ?? ""),
@@ -224,6 +237,7 @@ export class MemoryService {
       if (hasMemory) msgs.push(self.memoryCard(r!.cardsText));
       if (stateCard) msgs.push(self.transientCard(stateCard.text));
       if (lqCard) msgs.push(self.transientCard(lqCard.text));
+      if (progressCard) msgs.push(self.transientCard(progressCard.text));
 
       return { messages: msgs };
     };
@@ -236,6 +250,7 @@ export class MemoryService {
     await this.policyFor(accountId); // 预热策略缓存（会话装配即触发，起轮不再冷启动）
     return makeMemoryTools({
       dao: this.dao,
+      backend: this.backend,
       ownerAgent: rec.agentId,
       currentTurn: () => this.turns.get(accountId),
       // 每次装配取实时快照（新建 Agent 后仍能通过 N2 已知 person 校验，不落在构造期旧快照）。
@@ -503,7 +518,7 @@ export class MemoryService {
       this.dao.decaySweep(turn.ownerAgent, turn.virtualHours, policy);
 
       const text = envelopeText(envelope);
-      const ftsCandidates = this.dao.searchCandidates(turn.ownerAgent, text, false);
+      const ftsCandidates = this.backend.searchCandidates({ owner: turn.ownerAgent, query: text, includeFaded: false });
       // A29：主体候选补充——整条自然语言进 FTS 被当精确短语时，措辞不同的旧 gist 无候选；
       // 在场主体在 episode_subjects 里可反查，把「同一人物/场所」的情节捞回候选面。
       // self 是 owner 自聚焦兜底、范围过宽，DAO 内部已排除。
@@ -545,7 +560,7 @@ export class MemoryService {
             cards: selected.cards,
             cardsText,
             selectedIds: selected.selectedIds,
-            queryJson: JSON.stringify({ query: text }),
+            queryJson: JSON.stringify({ query: text, backend: this.backend.id }),
             candidateCount: candidates.length,
             selectedJson: JSON.stringify(selected.selectedIds),
             tokensL1: selected.tokens,

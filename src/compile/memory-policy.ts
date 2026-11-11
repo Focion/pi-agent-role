@@ -89,10 +89,11 @@ export function compileMemoryPolicy(
   const nv = record(input.narrativeVoice);
   const evo = record(input.evolution);
 
-  // big_five（缺省 0.5 = 中性）
-  const openness = num(pick(psy, "big_five", "openness"), 0.5);
-  const conscientiousness = num(pick(psy, "big_five", "conscientiousness"), 0.5);
-  const neuroticism = num(pick(psy, "big_five", "neuroticism"), 0.5);
+  // big_five（缺省 0.5 = 中性）。§12.2 约定取值为 [0,1]：非数字/NaN/Infinity 由 `num`
+  // 回退 0.5，越界的有限数由 `clamp01` 归一到 [0,1]（「非法值拒绝」= 归一到合法域，不产生越界产物）。
+  const openness = clamp01(num(pick(psy, "big_five", "openness"), 0.5));
+  const conscientiousness = clamp01(num(pick(psy, "big_five", "conscientiousness"), 0.5));
+  const neuroticism = clamp01(num(pick(psy, "big_five", "neuroticism"), 0.5));
 
   // emotion / attachment / cognition / sensory
   const empathy = num(pick(psy, "emotion", "empathy_level"), 0.5);

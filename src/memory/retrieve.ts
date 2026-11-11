@@ -4,8 +4,9 @@
 // 排序公式（五项加权，与 §12.1 的 write 判分是两个不同公式，不合并）：
 //   score = 0.40·relevance + 0.25·retention + 0.20·subjectMatch
 //         + 0.10·recencyVirtual + 0.05·valenceExtremity
-// relevance 经 bm25 取反后按**本次查询内**归一（§14.2.3）；faded/consolidated 候选
-// 再乘 penalty（0.5），只在 relevance 足够高（强线索）时才可能入选。
+// relevance 由后端导出（FTS5 为 -bm25，向量为相似度），越高越相关，按**本次查询内**归一
+// （§14.2.3）；faded/consolidated 候选再乘 penalty（0.5），只在 relevance 足够高（强线索）
+// 时才可能入选。
 //
 // 预算（§14.1.2 / §14.5.3）：L1 卡片 900 token，自动注入与 recall 共享同一池，
 // recall 保留 300 底线。TurnRetrievalLedger 是这一约束的唯一实现。
@@ -32,11 +33,12 @@ export interface RankedCandidate {
   score: number;
 }
 
-/** bm25 负值取反后按本次查询最大值归一（§14.2.3 normalizeRelevance）。 */
-function normalizeRelevance(bm25Values: number[]): number[] {
-  const s = bm25Values.map((b) => -b);
-  const max = Math.max(...s, 1e-9);
-  return s.map((v) => v / max);
+/** 后端 relevances（越高越相关）按本次查询最大值归一（§14.2.3）；负值截断为 0，
+ *  兼容尚未取反的裸向量后端。 */
+function normalizeRelevance(values: number[]): number[] {
+  const clamped = values.map((v) => (v < 0 ? 0 : v));
+  const max = Math.max(...clamped, 1e-9);
+  return clamped.map((v) => v / max);
 }
 
 /** 主体的在场集合 key：self 恒 "self"，其余为 `${type}:${id}`（A27）。 */
@@ -64,7 +66,7 @@ export function rankCandidatesWithSubjects(
   subjectsByEpisode: Map<string, SubjectRef[]>,
   ctx: RankContext,
 ): RankedCandidate[] {
-  const relevances = normalizeRelevance(candidates.map((c) => c.bm25));
+  const relevances = normalizeRelevance(candidates.map((c) => c.relevance));
   const ranked: RankedCandidate[] = candidates.map((c, i) => {
     const relevance = relevances[i]!;
     const retention = c.retention;

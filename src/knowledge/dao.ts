@@ -18,6 +18,21 @@ import { modelConfigHashFromJson } from "../compile/fingerprint.js";
 
 const clamp01 = (x: number): number => (x < 0 ? 0 : x > 1 ? 1 : x);
 
+/** pending_taught 一行（§17.2 Q05：taught 证据延迟成立的中转台账）。 */
+export interface PendingTaughtRow {
+  pendingId: string;
+  ownerAgent: string;
+  knId: string;
+  topic: string;
+  listenerRef: string;
+  evidence: string | null;
+  episodeId: string | null;
+  virtualTs: string;
+  virtualHours: number;
+  status: "open" | "resolved" | "rejected";
+  createdAt: string;
+}
+
 /** knowledge_items 一行（反查快照 + 测试观察）。 */
 export interface KnowledgeItemRow {
   knId: string;
@@ -210,6 +225,127 @@ export class KnowledgeDao {
         .all(owner, knId) as Array<{ d: number }>
     ).map((r) => r.d);
     return { count, days };
+  }
+
+  /** 某情节的全部主体（§17.2 taught 双证据 condition 1 用：找 person 听者 + knowledge 主题）。 */
+  episodeSubjects(episodeId: string): Array<{ type: string; id: string }> {
+    return (
+      this.db
+        .prepare<[string], { subject_type: string; subject_id: string }>(
+          `SELECT subject_type, subject_id FROM episode_subjects WHERE episode_id = ?`,
+        )
+        .all(episodeId) as Array<{ subject_type: string; subject_id: string }>
+    ).map((r) => ({ type: r.subject_type, id: r.subject_id }));
+  }
+
+  /**
+   * §17.2 taught 双证据 condition 2：听者侧关于该 topic 的知识已迁移到 ≥understood 且
+   * 归因讲者。这是 C4 记忆隔离的**唯一一处例外**——跨分区读，只给服务层回答布尔，
+   * 听者的具体状态不泄露给讲者（§17.2）。
+   */
+  listenerProgress(listener: string, topic: string, speakerRef: string): boolean {
+    return (
+      this.db
+        .prepare<[string, string, string], { n: number }>(
+          `SELECT 1 AS n FROM knowledge_items
+            WHERE owner_agent = ? AND topic = ? AND taught_by = ?
+              AND mastery IN ('understood','applied','mastered')`,
+        )
+        .get(listener, topic, speakerRef) !== undefined
+    );
+  }
+
+  /** 记录一条 delayed 成立的 taught 证据（§17.2 Q05：讲者先记 pending，等听者迁移）。 */
+  insertPendingTaught(row: {
+    pendingId: string;
+    ownerAgent: string;
+    knId: string;
+    topic: string;
+    listenerRef: string;
+    evidence: string | null;
+    episodeId: string | null;
+    virtualTs: string;
+    virtualHours: number;
+  }): void {
+    this.db
+      .prepare(`
+        INSERT INTO pending_taught
+          (pending_id, owner_agent, kn_id, topic, listener_ref, evidence, episode_id,
+           virtual_ts, virtual_hours, status, created_at)
+        VALUES (@pendingId, @owner, @knId, @topic, @listenerRef, @evidence, @episodeId,
+                @virtualTs, @virtualHours, 'open', @now)
+      `)
+      .run({ ...row, owner: row.ownerAgent, now: this.nowReal() });
+  }
+
+  /** 某讲者尚未确认的 pending_taught（日终回补扫描用）。 */
+  openPendingTaught(owner: string): PendingTaughtRow[] {
+    const rows = this.db
+      .prepare<[string], Record<string, unknown>>(
+        `SELECT pending_id, owner_agent, kn_id, topic, listener_ref, evidence, episode_id,
+                virtual_ts, virtual_hours, status, created_at
+           FROM pending_taught WHERE owner_agent = ? AND status = 'open' ORDER BY created_at`,
+      )
+      .all(owner);
+    return rows.map((r) => ({
+      pendingId: r.pending_id as string,
+      ownerAgent: r.owner_agent as string,
+      knId: r.kn_id as string,
+      topic: r.topic as string,
+      listenerRef: r.listener_ref as string,
+      evidence: (r.evidence as string | null) ?? null,
+      episodeId: (r.episode_id as string | null) ?? null,
+      virtualTs: r.virtual_ts as string,
+      virtualHours: r.virtual_hours as number,
+      status: (r.status as PendingTaughtRow["status"]) ?? "open",
+      createdAt: r.created_at as string,
+    }));
+  }
+
+  /** 把一条 pending 标为已结算（promotion 完成或放弃后调用，防重复回补）。 */
+  markPendingSettled(pendingId: string, status: "resolved" | "rejected"): void {
+    this.db
+      .prepare(`UPDATE pending_taught SET status = ?, resolved_at = ? WHERE pending_id = ?`)
+      .run(status, this.nowReal(), pendingId);
+  }
+
+  /**
+   * 日终回补：把 pending 的 `taught` 证据落地为 mastered 成立——写一条 taught 事件 +
+   * 把讲者条目升到 mastered（retention 重置、practice_count+1、decay_from 清空）。
+   * 单事务；from 由调用方给出（通常 applied）。
+   */
+  applyTaughtPromotion(opts: {
+    evId: string;
+    knId: string;
+    owner: string;
+    from: Mastery;
+    evidence: string | null;
+    episodeId: string | null;
+    virtualTs: string;
+    virtualHours: number;
+  }): void {
+    const tx = this.db.transaction(() => {
+      this.db
+        .prepare(`
+          INSERT INTO knowledge_events
+            (ev_id, kn_id, owner_agent, from_mastery, to_mastery, evidence_kind,
+             evidence, episode_id, virtual_ts, virtual_hours, created_at)
+          VALUES (@evId, @knId, @owner, @from, 'mastered', 'taught',
+                  @evidence, @episodeId, @virtualTs, @virtualHours, @now)
+        `)
+        .run({ ...opts, now: this.nowReal() });
+      this.db
+        .prepare(`
+          UPDATE knowledge_items
+             SET mastery = 'mastered', retention = 1.0,
+                 practice_count = practice_count + 1,
+                 last_practiced_at = @lastPracticedAt, last_practiced_vhours = @vh,
+                 decay_from = NULL, updated_at = @now
+           WHERE kn_id = @knId AND owner_agent = @owner
+        `)
+        .run({ knId: opts.knId, owner: opts.owner, lastPracticedAt: opts.virtualTs, vh: opts.virtualHours, now: this.nowReal() });
+    });
+    tx();
   }
 
   // ─── 写 ────────────────────────────────────────────────────────────────────
@@ -482,11 +618,15 @@ export class KnowledgeDao {
         if (!Array.isArray(parsed.learningQueue)) continue;
         return (parsed.learningQueue as Array<Record<string, unknown>>)
           .filter((x) => x && typeof x === "object" && typeof x.topic === "string")
-          .map((x) => ({
-            topic: String(x.topic),
-            priority: x.priority === "high" || x.priority === "medium" || x.priority === "low" ? x.priority : "medium",
-            motivation: typeof x.motivation === "string" ? x.motivation.slice(0, 200) : "",
-          }));
+          .map((x) => {
+            const enqueued = typeof x.enqueuedVhours === "number" && Number.isFinite(x.enqueuedVhours) ? Math.floor(x.enqueuedVhours) : undefined;
+            return {
+              topic: String(x.topic),
+              priority: x.priority === "high" || x.priority === "medium" || x.priority === "low" ? x.priority : "medium",
+              motivation: typeof x.motivation === "string" ? x.motivation.slice(0, 200) : "",
+              ...(enqueued !== undefined ? { enqueuedVhours: enqueued } : {}),
+            };
+          });
       } catch {
         continue;
       }
