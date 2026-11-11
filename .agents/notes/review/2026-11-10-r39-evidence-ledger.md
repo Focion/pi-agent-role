@@ -5,7 +5,7 @@ status: done
 owner: Claude Code
 tags: [review, audit, evidence, release]
 related:
-  - ../plan/2026-11-02-consolidated-audit-and-mesh-alignment-plan.md
+  - ../archive/2026-11-02-consolidated-audit-and-mesh-alignment-plan.md
 ---
 
 ## 评审对象

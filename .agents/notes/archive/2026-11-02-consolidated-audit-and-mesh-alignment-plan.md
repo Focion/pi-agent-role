@@ -1,7 +1,10 @@
 ---
 title: pi-agent-role 统一审计、mesh 适配与 0.1.0 核心闭环计划
 date: 2026-11-02
-status: active
+status: archived
+archived_date: 2026-11-11
+archived_from: notes/plan/2026-11-02-consolidated-audit-and-mesh-alignment-plan.md
+archived_reason: 核心闭环已全部关闭（R01–R39/A01–A38/M01–M05/O01–O07/D01–D02/DIF01–DIF08 全关闭）；剩余两平台/真实模型抽样/长跑/发布见 notes/plan/2026-11-11-release-and-acceptance-remaining.md
 owner: 待指定
 tags: [plan, audit, mesh-compatibility, migration, release, role-agent]
 related:
@@ -12,6 +15,8 @@ related:
   - ../tech/ROLE-AGENT-DESIGN.md
   - ../tech/2026-09-14-mesh-strategy-slot-signatures.md
 ---
+
+> **已归档（2026-11-11）**：核心闭环已全部关闭，本文转入归档作为历史依据。剩余两平台/真实模型抽样/长跑/发布见 `notes/plan/2026-11-11-release-and-acceptance-remaining.md`。
 
 ## 结论与本轮边界
 

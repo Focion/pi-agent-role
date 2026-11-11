@@ -10,7 +10,7 @@
 - 技术栈：TypeScript、SQLite（`better-sqlite3`）、npm、Vitest、tsup；包发布 ESM、CJS 和类型声明。
 - 入口与关键模块：`src/index.ts` 的 `createRuntime(options)`。源码导航及开发约束见 [根 AGENTS.md](../AGENTS.md)。
 - 本地检查命令：`npm run check:imports`、`npm run typecheck`、`npm test`、`npm run build`。先核验 Node.js、原生依赖及同级 mesh 产物；fake 测试不证明 SDK 适配可用。
-- 当前计划：[统一审计、mesh 适配与核心闭环](notes/plan/2026-11-02-consolidated-audit-and-mesh-alignment-plan.md)，状态为 active，H01–H04 已获用户确认。四份旧 plan 由此接管；方案确认和归档都不表示未完成项已关闭。
+- 当前计划：[剩余发布与验收](notes/plan/2026-11-11-release-and-acceptance-remaining.md)，状态为 active。核心闭环与 H01–H04 已确认并归档至 [统一审计、mesh 适配与核心闭环](notes/archive/2026-11-02-consolidated-audit-and-mesh-alignment-plan.md)。方案确认和归档都不表示未完成项已关闭。
 
 ## 目录地图
 

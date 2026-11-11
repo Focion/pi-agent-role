@@ -6,10 +6,10 @@ owner: 待定
 tags: [mesh, policies, interface, role-agent]
 related:
   - ROLE-AGENT-DESIGN.md
-  - ../plan/2026-11-02-consolidated-audit-and-mesh-alignment-plan.md
+  - ../archive/2026-11-02-consolidated-audit-and-mesh-alignment-plan.md
 ---
 
-> **版本提示（2026-11-02，D02 增补）**：本文记录 mesh v0.1.0 的历史签名。当前同级 mesh 已迁移到 **v0.2.0**（Node ≥ 24、`better-sqlite3 ^13.0.3`），本文不是新版本的接口契约；逐槽 TS 签名需以新 mesh `src/core/types.ts` 为准。已确认的执行边界：**H01** mesh 固定、只在 role 侧适配，不修 mesh、不改 schema、不新增接口；**H04** abort 只停新 cue、在途收敛、不伪造 `consumed`；多进程的 `transport:"sameHost"`/outbox/租约全在 mesh、role 只透传（O07）。差异、适配与完整边界统一见 [统一计划](../plan/2026-11-02-consolidated-audit-and-mesh-alignment-plan.md) 的 H01–H04、Q01–Q10。本轮保留正文，待适配验收后再校准签名。
+> **版本提示（2026-11-02，D02 增补）**：本文记录 mesh v0.1.0 的历史签名。当前同级 mesh 已迁移到 **v0.2.0**（Node ≥ 24、`better-sqlite3 ^13.0.3`），本文不是新版本的接口契约；逐槽 TS 签名需以新 mesh `src/core/types.ts` 为准。已确认的执行边界：**H01** mesh 固定、只在 role 侧适配，不修 mesh、不改 schema、不新增接口；**H04** abort 只停新 cue、在途收敛、不伪造 `consumed`；多进程的 `transport:"sameHost"`/outbox/租约全在 mesh、role 只透传（O07）。差异、适配与完整边界统一见 [统一计划](../archive/2026-11-02-consolidated-audit-and-mesh-alignment-plan.md) 的 H01–H04、Q01–Q10。本轮保留正文，待适配验收后再校准签名。
 
 ## 方案概述
 
