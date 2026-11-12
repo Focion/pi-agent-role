@@ -1,0 +1,13 @@
+{
+  "llm": {
+    "model": "QwenAPI:qwen3.8-27b",
+    "thinkingLevel": "low",
+    "providers": {
+      "QwenAPI": {
+        "baseUrl": "https://your-openai-compatible-endpoint/v1",
+        "api": "openai-completions",
+        "apiKeyEnv": "QWEN_API_KEY"
+      }
+    }
+  }
+}

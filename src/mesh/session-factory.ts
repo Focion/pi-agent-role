@@ -2,8 +2,8 @@
 // SessionFactory（§3.7 ①）——本环唯一直接接触 pi SDK 的槽（唯一必填）
 //
 // 承载四件事：模型绑定(C6) / System Prompt 注入 / 工具面分叉(§3.8) / ext 注入装饰(C10)。
-// P0 先落工具面分叉 + ext 装饰；模型绑定与 System Prompt 编译在 P1（model-resolver
-// + identity 编译器）接上，届时 backend 换成 mesh 的 createPiSessionFactory。
+// 真实后端为 pi-durable 1.5 自建工厂（createPiBackend + Harness.open/root，M01–M02），
+// model-resolver + identity 编译器已接上；fake 后端仅供无 LLM 测试。
 //
 // 三条纪律（§3.7 ①）：
 //   1. create 与 open 必须产出等价会话（除历史外）——工具面同源已是这里保证；
@@ -11,7 +11,7 @@
 //   2. dispose 必须实现（idleEvictMs 到期 evict 时刷出未落库领域状态）。
 //   3. 不受 policyTimeoutMs 约束 ≠ 无限慢（NO_SESSION 是六个 park 原因中唯一要告警的）。
 //
-// 后端（backend）缺省为 fake（无 LLM），供测试与 P0 冒烟；P1 接 pi SDK。
+// 后端（backend）缺省为 fake（无 LLM），供测试冒烟；真实后端经 createPiBackend（pi-durable 1.5）。
 // ═══════════════════════════════════════════════════════════════════════════
 
 import { REJECT_CODES } from "@pi/agent-mesh/core";
@@ -28,7 +28,7 @@ export interface RoleSessionFactoryContext {
   runtimeRef?: string;
 }
 
-/** 真实 pi 会话后端（P1 用 mesh 的 createPiSessionFactory 实现）；P0 用 fake。 */
+/** 真实 pi 会话后端（createPiBackend 实现，pi-durable 1.5，M01–M02）；缺省 fake。 */
 export interface SessionBackend {
   create(ctx: RoleSessionFactoryContext & { tools: ToolDefinition[] }): Promise<{ session: unknown; runtimeRef: string }>;
   open(ctx: RoleSessionFactoryContext & { tools: ToolDefinition[] }): Promise<{ session: unknown }>;

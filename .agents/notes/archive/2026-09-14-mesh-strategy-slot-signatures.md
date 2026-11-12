@@ -1,15 +1,19 @@
 ---
 title: 九策略槽实现签名（对照 mesh 真实接口）
 date: 2026-09-14
-status: draft
+status: archived
 owner: 待定
 tags: [mesh, policies, interface, role-agent]
 related:
-  - ROLE-AGENT-DESIGN.md
-  - ../archive/2026-11-02-consolidated-audit-and-mesh-alignment-plan.md
+  - ../tech/ROLE-AGENT-DESIGN.md
+  - 2026-11-02-consolidated-audit-and-mesh-alignment-plan.md
+  - ../changelog/2026-11-11-mesh-v0-2-0-adapter.md
+archived_date: 2026-11-11
+archived_from: notes/plan/2026-09-14-mesh-strategy-slot-signatures.md
+archived_reason: mesh v0.2.0 九策略槽适配已验收（typecheck / check:imports / 全量测试全绿），逐槽签名已校准并折入代码与 ROLE-AGENT-DESIGN.md §27.4；本文保留 v0.1.0 历史签名作追溯
 ---
 
-> **版本提示（2026-11-02，D02 增补）**：本文记录 mesh v0.1.0 的历史签名。当前同级 mesh 已迁移到 **v0.2.0**（Node ≥ 24、`better-sqlite3 ^13.0.3`），本文不是新版本的接口契约；逐槽 TS 签名需以新 mesh `src/core/types.ts` 为准。已确认的执行边界：**H01** mesh 固定、只在 role 侧适配，不修 mesh、不改 schema、不新增接口；**H04** abort 只停新 cue、在途收敛、不伪造 `consumed`；多进程的 `transport:"sameHost"`/outbox/租约全在 mesh、role 只透传（O07）。差异、适配与完整边界统一见 [统一计划](../archive/2026-11-02-consolidated-audit-and-mesh-alignment-plan.md) 的 H01–H04、Q01–Q10。本轮保留正文，待适配验收后再校准签名。
+> **已归档（2026-11-11）**：本文记录 mesh **v0.1.0** 的历史签名，正文已按 **v0.2.0** 校准并折入代码与 [ROLE-AGENT-DESIGN.md §27.4](../tech/ROLE-AGENT-DESIGN.md)，不再作为新版本的接口契约使用。逐槽签名以新 mesh `src/core/types.ts` 与 [变更说明](../changelog/2026-11-11-mesh-v0-2-0-adapter.md) 为准。执行边界不变：**H01** mesh 固定、只在 role 侧适配，不修 mesh、不改 schema、不新增接口；**H04** abort 只停新 cue、在途收敛、不伪造 `consumed`；多进程的 `transport:"sameHost"`/outbox/租约全在 mesh、role 只透传（O07）。与 v0.1.0 相对的三处漂移（⑤ clock 由默认改实现、⑥ accessControl 9→10 钩子、⑨ `piSessionId`→`runtimeRef`）在对应小节与「改动清单」内标注。完整差异见 [统一计划](2026-11-02-consolidated-audit-and-mesh-alignment-plan.md) 的 H01–H04、Q01–Q10。
 
 ## 方案概述
 
@@ -19,8 +23,8 @@ related:
 
 | 立场 | 槽 | 落文件 |
 |---|---|---|
-| 实现（5） | `sessionFactory`★必填、`activation`、`floor`、`renderer`、`accessControl` | `src/mesh/session-factory.ts` + `src/mesh/policies/{activation,floor,renderer,access-control}.ts` |
-| 用默认（4） | `delivery`、`clock`、`retention`、`endpointSelector` | 无文件 |
+| 实现（6） | `sessionFactory`★必填、`activation`、`floor`、`renderer`、`accessControl`、`clock` | `src/mesh/session-factory.ts` + `src/mesh/policies/{activation,floor,renderer,access-control}.ts` + `src/scene/clock.ts` |
+| 用默认（3） | `delivery`、`retention`、`endpointSelector` | 无文件 |
 
 ## 背景与约束
 
@@ -39,7 +43,7 @@ related:
 | 2 | `activation` | 实现 | `silent_no_wake`（降为不唤醒） | 不覆盖 |
 | 3 | `floor` | 实现 | `free_for_all` | 不覆盖 |
 | 4 | `renderer` | 实现（只换内层文本） | `builtin_renderer` | 不覆盖 |
-| 5 | `clock` | 用默认 `WallClockLogicalClock` | `wallclock` | 不覆盖 |
+| 5 | `clock` | 实现（虚拟时钟 `compare`/`format`，`src/scene/clock.ts`） | `wallclock` | 不覆盖 |
 | 6 | `accessControl` | 实现（唯一 fail-closed） | `deny` | 不覆盖（**不**放宽到 200–500ms） |
 | 7 | `retention` | 用默认 `DefaultRetentionPolicy` | `cursor_only` | 不覆盖 |
 | 8 | `endpointSelector` | 用默认 `TopologyEndpointSelector` | `parked` | 不覆盖 |
@@ -131,7 +135,7 @@ interface Renderer {
 
 **闭包依赖**：`specs: Map<AccountId, {displayName; title}>`。**降级**：`builtin_renderer`（退回裸 id，也要保住 M4 包裹）。
 
-#### ⑤ `clock`（用默认）
+#### ⑤ `clock`（实现，虚拟时钟）
 
 ```ts
 interface LogicalClock {
@@ -140,7 +144,7 @@ interface LogicalClock {
 }
 ```
 
-**本环不实现**。虚拟时间排序权威是 `seq`，这个槽只影响展示排序。本环的虚拟时间（`ext.role.virtualTs`）服务记忆衰减/自省触发，**不是** `LogicalClock` 的职责（C11）。故 `mesh/policies/` 下**不存在 `clock.ts`**。
+**⚠️ v0.2.0 校准（三）**：本槽由「用默认」改为「实现」——`bootstrap.ts` 现传 `clock: makeLogicalClock()`，以 `W<周>D<日>T<时段>` 为唯一虚拟时间字面量（`compare`=整型投影相减、`format`=人类可读渲染），供 mesh 排序信封逻辑时间戳与回放。实现落在 `src/scene/clock.ts`（纯助手，只比较/格式化、永不推进；推进由编曲器每轮结束显式 `advanceVirtualTs`）。据此 `mesh/policies/` 下仍**不存在 `clock.ts`**（分层归属不同）；虚拟时间推进与 `seq` 语义不变（C11）。
 
 #### ⑥ `accessControl`（实现，唯一 fail-closed）
 
@@ -153,11 +157,11 @@ interface AccessControl {
     membership?: Membership;
   }): boolean | Promise<boolean>;
   canInitiateDirect?(from: Account, to: Account): boolean | Promise<boolean>;
-  // canRead / canWrite / canAdmin / canPublish / canMentionAll / canJoin / resolveCustomTag —— 本环不实现（缺省放行 / 库内建判定）
+  // canRead / canWrite / canAdmin / canPublish / canMentionAll / canJoin / canSubscribe / resolveCustomTag —— 本环不实现（缺省放行 / 库内建判定）
 }
 ```
 
-**⚠️ 与设计 §3.7⑥ 的签名差异（二，即 L9 已解决）**：真实 mesh 是**多钩子版**（9 个可选钩子），不是单方法 `can(ctx)`。本环只需实现其中两个：
+**⚠️ 与设计 §3.7⑥ 的签名差异（二，即 L9 已解决）**：真实 mesh 是**多钩子版**（v0.1.0 为 9 个可选钩子；v0.2.0 新增 `canSubscribe` 后为 10 个），不是单方法 `can(ctx)`。本环只需实现其中两个：
 
 ```ts
 // 自省隔离（D-A）：只有 X 本人能写 X:reflect 的会话
@@ -205,19 +209,21 @@ interface EndpointSelector {
 ```ts
 interface SessionFactory {           // mesh 侧 session 为 unknown（mesh-core 零 pi 依赖）
   create(ctx: { endpoint: Endpoint; account: Account; tools: ToolDefinition[] }):
-    Promise<{ session: unknown; piSessionId: string }>;
-  open(ctx: { endpoint: Endpoint; account: Account; piSessionId: string; tools: ToolDefinition[] }):
+    Promise<{ session: unknown; runtimeRef: string }>;
+  open(ctx: { endpoint: Endpoint; account: Account; runtimeRef: string; tools: ToolDefinition[] }):
     Promise<{ session: unknown }>;
   dispose?(ctx: { endpoint: Endpoint; session: unknown }): Promise<void>;
 }
 
-// 本环在 src/mesh/session-factory.ts 把 unknown 收窄为 pi 的 AgentSession：
+// 本环在 src/mesh/session-factory.ts 把 unknown 收窄为 pi-durable 会话：
 interface AppSessionFactory {
-  create(ctx): Promise<{ session: AgentSession; piSessionId: string }>; // @earendil-works/pi-coding-agent
-  open(ctx):   Promise<{ session: AgentSession }>;
+  create(ctx): Promise<{ session: unknown; runtimeRef: string }>; // runtimeRef = encodeRuntimeRef({storagePath, conversationId})（mesh MD7 不透明编码）
+  open(ctx):   Promise<{ session: unknown }>;
   dispose?(ctx): Promise<void>;
 }
 ```
+
+**⚠️ v0.2.0 校准（一）**：字段由 `piSessionId` 更名为 `runtimeRef`（create 返回与 open 入参同步）；本环后端改为 pi-durable 1.5 自建工厂（`createPiBackend` + `Harness.open`/root，M01–M02），不再走 mesh 的 session 工厂。
 
 **承载四件事**（设计 §3.7①）：模型绑定（C6）、System Prompt 注入（C1）、工具面分叉（§3.8）、`ext` 注入装饰（C10）。**三条铁律**：
 
@@ -239,13 +245,14 @@ interface AppSessionFactory {
 
 | 位置 | 改动内容 |
 | --- | --- |
-| `src/mesh/bootstrap.ts` | `createMesh({ dbPath: mesh.db, devMode: true, policies: { sessionFactory, activation, floor, renderer, accessControl }, limits })`；只传 4 个自实现槽 + `sessionFactory`，其余 4 槽不传走默认 |
-| `src/mesh/session-factory.ts` | 实现 `AppSessionFactory`（窄化 `unknown`→`AgentSession`）+ 三钩子 + I23 链尾 |
+| `src/mesh/bootstrap.ts` | `createMesh({ dbPath: mesh.db, devMode: true, policies: { sessionFactory, activation, floor, renderer, accessControl, clock }, limits, transport/transportOptions/recoverDeadEndpoints/busyTimeoutMs })`；传 5 个自实现槽 + `sessionFactory` + `clock`，multiprocess 字段透传（O07），其余 3 槽不传走默认 |
+| `src/mesh/session-factory.ts` | 实现 `AppSessionFactory`（窄化 `unknown`）+ 三钩子 + I23 链尾；v0.2.0 起字段为 `runtimeRef`（非 `piSessionId`） |
 | `src/mesh/policies/activation.ts` | 实现 `ActivationPolicy`（读内存态，不读 ext） |
 | `src/mesh/policies/floor.ts` | 实现 `FloorPolicy`（按 `turn_policy` 分派，空集=沉默） |
 | `src/mesh/policies/renderer.ts` | 实现 `Renderer`（内层文本） |
-| `src/mesh/policies/access-control.ts` | 实现 `AccessControl` 的 `canSend` + `canInitiateDirect`（同步纯函数） |
-| （无） | `delivery`/`clock`/`retention`/`endpointSelector` 不建文件，用 mesh 默认 |
+| `src/mesh/policies/access-control.ts` | 实现 `AccessControl` 的 `canSend` + `canInitiateDirect`（同步纯函数；v0.2.0 钩子 9→10，新增 `canSubscribe`） |
+| `src/scene/clock.ts` | 实现 `LogicalClock`（虚拟时钟 `compare`/`format`；v0.2.0 起本槽由默认改为实现） |
+| （无） | `delivery`/`retention`/`endpointSelector` 不建文件，用 mesh 默认 |
 
 ## 备选方案与取舍
 

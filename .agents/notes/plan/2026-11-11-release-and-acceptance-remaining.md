@@ -7,7 +7,7 @@ tags: [plan, release, acceptance, role-agent]
 related:
   - ../archive/2026-11-02-consolidated-audit-and-mesh-alignment-plan.md
   - ../tech/ROLE-AGENT-DESIGN.md
-  - ../tech/2026-09-14-mesh-strategy-slot-signatures.md
+  - ../archive/2026-09-14-mesh-strategy-slot-signatures.md
   - ../review/2026-11-10-r39-evidence-ledger.md
 ---
 

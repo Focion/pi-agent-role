@@ -30,6 +30,9 @@ export type {
   RetireResult,
   RestoreResult,
   DeleteAgentResult,
+  BlueprintLineage,
+  ExportAsBlueprintInput,
+  ExportAsBlueprintResult,
   MeshConsistencyReport,
   MeshConsistencyAgent,
   MeshConsistencyFinding,
@@ -37,6 +40,9 @@ export type {
   CreateFacilityInput,
   CreateFacilityResult,
   SceneApi,
+  SceneParticipantInput,
+  CreateSceneInput,
+  SceneRunOptions,
   ReflectApi,
   MemoryApi,
   MemoryRecallResult,
@@ -47,6 +53,25 @@ export type {
   ReplayApi,
   RoleInvariantReport,
 } from "./runtime/types.js";
+
+export type {
+  ReprojectResult,
+  ReconcileImport,
+  ReconcileResult,
+} from "./runtime/projector.js";
+
+export type {
+  DirectorStep,
+  DirectorScript,
+  FloorMode,
+  SceneParticipant,
+  SceneParticipantRole,
+  SceneEstablished,
+  SceneRunResult,
+  SceneInvariantViolation,
+  SceneInjection,
+  SceneInjectionInput,
+} from "./scene/types.js";
 
 export type {
   DomainDecisionReplay,
@@ -87,6 +112,12 @@ export type {
 } from "./reflect/types.js";
 
 export type { RoleCostMetrics } from "./inspect/cost.js";
+
+export type {
+  DanglingAnchor,
+  DanglingAnchorKind,
+  DanglingScanResult,
+} from "./inspect/dangling-scan.js";
 
 export type {
   BlueprintSchemaKind,

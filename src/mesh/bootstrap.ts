@@ -44,7 +44,7 @@ export interface RoleMeshOptions {
   transportOptions?: { pollIntervalMs?: number; claimTtlMs?: number; maxAttempts?: number };
   recoverDeadEndpoints?: boolean;
   busyTimeoutMs?: number;
-  /** 会话后端；缺省 fake（无 LLM）。P1 换 createPiSessionFactory。 */
+  /** 会话后端；缺省 fake（无 LLM）。真实后端经 createPiBackend（pi-durable 1.5，M01–M02）。 */
   backend?: SessionBackend;
   /** 逐账号领域工具处理器（P3 记忆：remember/recall 需按 owner 分区闭包；异步装配）。 */
   domainHandlersFor?: RoleSessionFactoryOptions["domainHandlersFor"];

@@ -8,12 +8,12 @@
 - 这是供宿主嵌入的库，不是独立应用：不添加 CLI、HTTP 监听或进程级全局运行时。公开工厂为 `src/index.ts` 中的 `createRuntime(options)`，同时导出公开类型和错误。
 - 角色差异由模板与数据表达，不为老师、学生等具体角色增加专用代码分支。通讯、投递和会话恢复交给 mesh，角色域负责身份、记忆、知识、自省、设施和场景。
 - 动手前查看 [剩余发布与验收计划](.agents/notes/plan/2026-11-11-release-and-acceptance-remaining.md)（当前唯一未完成项）。核心闭环已完成，完整审计与 H01–H04 决策见 [已归档统一计划](.agents/notes/archive/2026-11-02-consolidated-audit-and-mesh-alignment-plan.md)。四份旧 plan 与统一计划均已归档，归档只保留历史依据；不把旧勾选或 `todo` 当成当前实现状态。
-- 架构依据是 [ROLE-AGENT-DESIGN.md](.agents/notes/tech/ROLE-AGENT-DESIGN.md)；按需定位 §1（约束）、§2–3（分层与映射）、§18（存储）、§22（模块边界）、§27（决议），不要无差别通读大文档。策略适配另见 [mesh 策略槽签名](.agents/notes/tech/2026-09-14-mesh-strategy-slot-signatures.md)。
+- 架构依据是 [ROLE-AGENT-DESIGN.md](.agents/notes/tech/ROLE-AGENT-DESIGN.md)；按需定位 §1（约束）、§2–3（分层与映射）、§18（存储）、§22（模块边界）、§27（决议），不要无差别通读大文档。策略适配另见 [mesh v0.2.0 适配变更说明](.agents/notes/changelog/2026-11-11-mesh-v0-2-0-adapter.md)；九策略槽逐槽签名（已归档，含 v0.2.0 校准）见 [mesh 策略槽签名](.agents/notes/archive/2026-09-14-mesh-strategy-slot-signatures.md)。
 - 文档归档与命名遵循 [.agents/AGENTS.md](.agents/AGENTS.md)。当前入口、命令和模块以源码及配置为准。发现设计与实现冲突时先说明差异，不自行推翻既有决策。
 
 ## 环境与常用命令
 
-- 使用 npm 和已提交的 `package-lock.json`。本库根包仍声明 Node.js `>=20`，旧 SDK 链要求 `>=22.19.0`；同级 mesh 已迁移到 v0.2.0，目标运行环境为 Node.js 24+。本库依赖、锁文件和后端适配尚未对齐，不能把旧 Node.js 22.19+ 说明当成当前配套环境已受支持。差异与验收见已归档统一计划。
+- 使用 npm 和已提交的 `package-lock.json`。本库根包声明 Node.js `>=24.0.0`、`better-sqlite3 ^13.0.3`，与同级 mesh v0.2.0（pi SDK 1.5.0 链）已对齐：依赖、锁文件与后端适配（M01–M05）均已落地。逐槽校验见 [mesh v0.2.0 适配变更说明](.agents/notes/changelog/2026-11-11-mesh-v0-2-0-adapter.md)，执行边界统一见已归档统一计划。
 - `@pi/agent-mesh` 通过 `file:../pi-agent-mesh` 引用同级仓库。安装前确认该依赖及其包产物可用；不要为绕过缺失依赖擅自替换为 registry 版本或修改上游仓库。
 - `better-sqlite3` 为原生依赖，安装可能需要本机编译工具链。真实模型后端还需要 pi SDK 与相应模型认证；fake 后端测试通过不代表真实模型调用可用。
 
@@ -47,7 +47,7 @@ npm run build            # 生成 dist/ 下 ESM、CJS 和类型声明
 
 - mesh 接触面集中在 `src/mesh/**`：其他源码不得导入 `@pi/agent-mesh`、在 SQL 中引用 `mesh_*` 表或使用 `ext.`。`src/mesh/policies/**` 不得引用 `ext` 标识符；这些限制由 `scripts/check-imports.mjs` 检查。
 - `src/authoring/**` 不得导入 `mesh`、`db`、`memory`、`scene`、`agent` 领域目录；蓝本生成不直接操作运行期状态。以静态门禁列出的实际规则为准，不靠关闭门禁绕过分层。
-- 禁止裸调用 `clearQueue`。本库现有 `beforeClearQueue` 调用属于旧协议，同级 mesh v0.2.0 已移除该 API。适配按已归档统一计划 M04 退役旧调用，保留 submission 幂等、中止、close 与恢复回归。不得手工标记 `consumed` 来加速关闭。
+- 禁止裸调用 `clearQueue`。旧 `beforeClearQueue` 协议已随 mesh v0.2.0 退役（M04 完成，本库已无活动调用），保留 submission 幂等、中止、close 与恢复回归。不得手工标记 `consumed` 来加速关闭。
 - `role-agent.db` 与 mesh 数据库分离：不得在角色库创建 `mesh_*` 对象或通过 `ATTACH` 跨库耦合。schema 位于 `migrations/`，版本由 `src/db/db.ts` 的 `SCHEMA_VERSION` 与 `PRAGMA user_version` 跟踪；schema 变更需同步建库/迁移脚本、版本、结构校验和测试，不在启动逻辑里临时补表。
 - 2026-11-02 用户确认：mesh 固定，只在 role 侧适配。本库尚未发布，允许重新定稿 role 初始 schema 并采用新建双库，不要求迁移旧开发数据。mesh 的 schema/脚本不改；普通启动不自动清库。首次发布后的升级与数据保留另设迁移策略。最新边界见已归档统一计划 H01/H02。
 - 回放按已确认的 H03 实现历史记录/领域决策回放与固定条件隔离场景重执行/compare。原会话任意历史点原位分叉不在范围，不等待 mesh forkAt。来源、owner、fidelity 和缺失信息明确；重执行不污染原环境，不冒称重建未记录的历史最终 prompt。
